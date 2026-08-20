@@ -57,10 +57,13 @@ const BT_SOURCE = cfg.BT_SOURCE || '';
 const whisperHostname = WHISPER_HOST.replace(/^https?:\/\//, '').split(':')[0];
 const OLLAMA_URL = cfg.OLLAMA_URL || `http://${whisperHostname}:11434`;
 const OLLAMA_MODEL = cfg.OLLAMA_MODEL || '';
-// Auto-select llm mode if a model is configured; TRANSLATE_MODE always wins if set explicitly.
+// Priority: explicit TRANSLATE_MODE > llm (if a model is configured) > whisper (double pass).
+// 'google' uses Google's free unofficial translate endpoint — a real NMT model, no chat-model
+// refusals/commentary. Recommended over 'llm' for translation quality.
 const TRANSLATE_MODE = cfg.TRANSLATE_MODE || (OLLAMA_MODEL ? 'llm' : 'whisper');
 
 const HTML_FILE = path.join(__dirname, 'call-console.html');
+const FAVICON_FILE = path.join(__dirname, 'favicon.ico');
 
 function log(label, ms) {
   console.log(`[${new Date().toISOString().slice(11, 19)}] ${label} — ${ms}ms`);
@@ -108,11 +111,11 @@ function proxyRequest(targetUrlStr, req, res, { label = 'proxy', timeoutMs = 600
   req.pipe(proxyReq);
 }
 
-async function callOllamaTranslate(germanText) {
+async function callOllamaTranslate(sourceText, sourceLangName) {
   const prompt =
-    `Translate the following German text to natural, fluent English. ` +
+    `Translate the following ${sourceLangName} text to natural, fluent English. ` +
     `Respond with only the English translation — no notes, no quotation marks, no preamble.\n\n` +
-    `German: ${germanText}\nEnglish:`;
+    `${sourceLangName}: ${sourceText}\nEnglish:`;
 
   const res = await fetch(`${OLLAMA_URL.replace(/\/$/, '')}/api/generate`, {
     method: 'POST',
@@ -129,6 +132,22 @@ async function callOllamaTranslate(germanText) {
   return (data.response || '').trim();
 }
 
+async function callGoogleTranslate(sourceText, sourceLangCode) {
+  const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${encodeURIComponent(sourceLangCode)}&tl=en&dt=t&q=${encodeURIComponent(sourceText)}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('google translate HTTP ' + res.status);
+  const data = await res.json();
+  // Response shape: [[[translatedChunk, originalChunk, ...], ...], ...]
+  const translated = (data[0] || []).map(seg => seg[0]).join('');
+  return translated.trim();
+}
+
+const LANGUAGE_NAMES = {
+  de:'German', en:'English', fr:'French', es:'Spanish', it:'Italian',
+  pt:'Portuguese', nl:'Dutch', pl:'Polish', tr:'Turkish', ru:'Russian',
+  ar:'Arabic', hi:'Hindi', ja:'Japanese', ko:'Korean', zh:'Chinese'
+};
+
 const server = http.createServer(async (req, res) => {
   const url = req.url.split('?')[0];
 
@@ -140,6 +159,19 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(data);
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && url === '/favicon.ico') {
+    fs.readFile(FAVICON_FILE, (err, data) => {
+      if (err) {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('favicon.ico not found next to server.js');
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'image/x-icon', 'Cache-Control': 'public, max-age=86400' });
       res.end(data);
     });
     return;
@@ -176,26 +208,31 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Translate: either LLM text-translation (fast) or a second Whisper audio pass (slow but simple).
+  // Translate: 'google' (recommended — real NMT, no chat-model refusals/commentary),
+  // 'llm' (Ollama text-translation), or 'whisper' (second full audio pass).
   if (req.method === 'POST' && url === '/translate') {
-    if (TRANSLATE_MODE === 'llm') {
+    if (TRANSLATE_MODE === 'google' || TRANSLATE_MODE === 'llm') {
       const t0 = Date.now();
       try {
         const bodyBuf = await readBody(req);
-        const { text } = JSON.parse(bodyBuf.toString('utf8') || '{}');
+        const { text, sourceLang } = JSON.parse(bodyBuf.toString('utf8') || '{}');
         if (!text) {
           res.writeHead(400, { 'Content-Type': 'text/plain' });
           res.end('missing text');
           return;
         }
-        const translated = await callOllamaTranslate(text);
-        log('translate (ollama/' + OLLAMA_MODEL + ')', Date.now() - t0);
+        const langCode = sourceLang || 'de';
+        const langName = LANGUAGE_NAMES[langCode] || langCode;
+        const translated = TRANSLATE_MODE === 'google'
+          ? await callGoogleTranslate(text, langCode)
+          : await callOllamaTranslate(text, langName);
+        log(`translate (${TRANSLATE_MODE === 'google' ? 'google' : 'ollama/' + OLLAMA_MODEL})`, Date.now() - t0);
         res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
         res.end(translated);
       } catch (err) {
-        log('translate (ollama) [error]', Date.now() - t0);
+        log(`translate (${TRANSLATE_MODE}) [error]`, Date.now() - t0);
         res.writeHead(502, { 'Content-Type': 'text/plain' });
-        res.end('ollama error: ' + err.message);
+        res.end(`${TRANSLATE_MODE} error: ` + err.message);
       }
     } else {
       proxyRequest(WHISPER_URL.replace(/\/$/, '') + '/inference', req, res, { label: 'translate (whisper)' });
@@ -210,6 +247,9 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`Vermittlung console:  http://localhost:${PORT}`);
   console.log(`Whisper backend:      ${WHISPER_URL}`);
-  console.log(`Translate mode:       ${TRANSLATE_MODE}${TRANSLATE_MODE === 'llm' ? ' (' + OLLAMA_URL + ', model=' + OLLAMA_MODEL + ')' : ' (double whisper pass)'}`);
+  const modeDesc = TRANSLATE_MODE === 'google' ? 'Google Translate (unofficial endpoint)'
+    : TRANSLATE_MODE === 'llm' ? `Ollama (${OLLAMA_URL}, model=${OLLAMA_MODEL})`
+    : 'double whisper pass';
+  console.log(`Translate mode:       ${TRANSLATE_MODE} — ${modeDesc}`);
   if (BT_SOURCE) console.log(`Expected BT source:   ${BT_SOURCE}`);
 });

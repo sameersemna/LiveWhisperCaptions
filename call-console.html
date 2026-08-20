@@ -3,6 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <title>Vermittlung — Live Call Console</title>
+<link rel="icon" type="image/x-icon" href="/favicon.ico">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2312151a'/%3E%3Ccircle cx='32' cy='32' r='22' fill='none' stroke='%236b5327' stroke-width='3'/%3E%3Ccircle cx='32' cy='32' r='13' fill='%23e8a33d'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='%23f5c878' stroke-width='1.5' opacity='0.6'/%3E%3C/svg%3E">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Sans:ital@1&display=swap" rel="stylesheet">
@@ -280,6 +282,26 @@
     <input type="text" id="serverUrl" value="loading…" spellcheck="false" readonly style="color:var(--text-muted); cursor:default;">
   </div>
   <div class="field">
+    <label for="sourceLang">Source language</label>
+    <select id="sourceLang" style="min-width:170px;">
+      <option value="de" selected>German</option>
+      <option value="en">English</option>
+      <option value="fr">French</option>
+      <option value="es">Spanish</option>
+      <option value="it">Italian</option>
+      <option value="pt">Portuguese</option>
+      <option value="nl">Dutch</option>
+      <option value="pl">Polish</option>
+      <option value="tr">Turkish</option>
+      <option value="ru">Russian</option>
+      <option value="ar">Arabic</option>
+      <option value="hi">Hindi</option>
+      <option value="ja">Japanese</option>
+      <option value="ko">Korean</option>
+      <option value="zh">Chinese</option>
+    </select>
+  </div>
+  <div class="field">
     <label for="chunkLen">Chunk length</label>
     <select id="chunkLen">
       <option value="5">5s</option>
@@ -287,6 +309,15 @@
       <option value="12">12s</option>
       <option value="20">20s</option>
     </select>
+  </div>
+  <div class="field">
+    <label for="micSelect">Mic input</label>
+    <div style="display:flex; gap:6px;">
+      <select id="micSelect" style="min-width:260px;">
+        <option value="">detecting devices…</option>
+      </select>
+      <button class="btn btn-ghost" id="refreshMicBtn" type="button" title="Re-scan input devices" style="padding:8px 12px;">↻</button>
+    </div>
   </div>
   <button class="btn btn-start" id="startBtn">Start call</button>
   <button class="btn btn-stop" id="stopBtn" disabled>Stop</button>
@@ -299,9 +330,9 @@
 
 <main>
   <div class="pane">
-    <div class="pane-head de"><span>Deutsch — original</span><span class="flag">DE</span></div>
+    <div class="pane-head de" id="dePaneHead"><span id="dePaneLabel">Deutsch — original</span><span class="flag" id="dePaneFlag">DE</span></div>
     <div class="transcript" id="deTranscript">
-      <div class="empty-state" id="deEmpty">Press <b>Start call</b> once your Bluetooth<br>source is set as the default input.<br>German text appears here as it's heard.</div>
+      <div class="empty-state" id="deEmpty">Press <b>Start call</b> once your Bluetooth<br>source is set as the default input.<br>Source-language text appears here as it's heard.</div>
     </div>
   </div>
   <div class="pane">
@@ -328,6 +359,23 @@
   const footerLeft = $('footerLeft'), footerRight = $('footerRight'), serverCheck = $('serverCheck');
   const meterEl = $('meter'), jackStrip = $('jackStrip');
   const btHint = $('btHint');
+  const micSelect = $('micSelect');
+  const sourceLangEl = $('sourceLang');
+  const dePaneLabel = $('dePaneLabel'), dePaneFlag = $('dePaneFlag');
+
+  const LANGUAGE_NAMES = {
+    de:'Deutsch', en:'English', fr:'Français', es:'Español', it:'Italiano',
+    pt:'Português', nl:'Nederlands', pl:'Polski', tr:'Türkçe', ru:'Русский',
+    ar:'العربية', hi:'हिन्दी', ja:'日本語', ko:'한국어', zh:'中文'
+  };
+  function updatePaneLabels(){
+    const code = sourceLangEl.value;
+    const name = LANGUAGE_NAMES[code] || code.toUpperCase();
+    dePaneLabel.textContent = `${name} — original`;
+    dePaneFlag.textContent = code.toUpperCase();
+  }
+  sourceLangEl.addEventListener('change', updatePaneLabels);
+  updatePaneLabels();
 
   // build meter bars + jack strip
   const BAR_COUNT = 28, JACK_COUNT = 40;
@@ -410,8 +458,8 @@
       const cfg = await r.json();
       serverUrlEl.value = cfg.whisperUrl;
       translateMode = cfg.translateMode || 'whisper';
-      footerRight.textContent = translateMode === 'llm'
-        ? `large-v3 · ollama translate (${cfg.ollamaModel})`
+      footerRight.textContent = translateMode === 'google' ? 'large-v3 · google translate'
+        : translateMode === 'llm' ? `large-v3 · ollama translate (${cfg.ollamaModel})`
         : 'large-v3 · dual whisper pass';
       if (cfg.btSource){
         btHint.textContent = `expects default input: ${cfg.btSource}`;
@@ -422,6 +470,62 @@
   }
   loadConfig();
   checkServer();
+
+  // ---------- Explicit input device picker ----------
+  // Browsers on Linux don't reliably honor PulseAudio's default source, especially once
+  // a page has been granted mic access for a different device — so we let the user pick
+  // explicitly instead of trusting the OS default.
+  let btKeywordHint = '';
+  async function populateMicDevices(){
+    try{
+      // A throwaway getUserMedia call unlocks real device labels (they're blank until
+      // permission has been granted at least once for this origin).
+      const tmp = await navigator.mediaDevices.getUserMedia({audio:true});
+      tmp.getTracks().forEach(t => t.stop());
+
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const inputs = devices.filter(d => d.kind === 'audioinput');
+      micSelect.innerHTML = '';
+      if (inputs.length === 0){
+        micSelect.innerHTML = '<option value="">no input devices found</option>';
+        return;
+      }
+
+      // Heuristic match against the BT address/source name for a sensible default —
+      // browser device labels rarely include the bluez source string verbatim, so this
+      // is a best-effort guess (e.g. matches "bluetooth", "headset", part of the MAC).
+      btKeywordHint = (btHint.textContent.match(/([0-9A-Fa-f_]{17,})/) || [''])[0].replace(/_/g,':').toLowerCase();
+      const isBluetoothLabel = (label) => {
+        const l = label.toLowerCase();
+        return l.includes('bluetooth') || l.includes('headset') || l.includes('hands-free') || l.includes('hfp')
+          || (btKeywordHint && l.includes(btKeywordHint.slice(0,8)));
+      };
+
+      const btGroup = document.createElement('optgroup');
+      btGroup.label = 'Bluetooth';
+      const localGroup = document.createElement('optgroup');
+      localGroup.label = 'Local / computer audio';
+
+      let bestId = null;
+      inputs.forEach((d, i) => {
+        const opt = document.createElement('option');
+        opt.value = d.deviceId;
+        opt.textContent = d.label || `Input device ${i+1}`;
+        if (isBluetoothLabel(d.label || '')){
+          btGroup.appendChild(opt);
+          if (bestId === null) bestId = d.deviceId;
+        } else {
+          localGroup.appendChild(opt);
+        }
+      });
+      if (btGroup.children.length) micSelect.appendChild(btGroup);
+      if (localGroup.children.length) micSelect.appendChild(localGroup);
+      if (bestId !== null) micSelect.value = bestId;
+    }catch(e){
+      micSelect.innerHTML = '<option value="">mic permission needed — click Start call</option>';
+    }
+  }
+  populateMicDevices();
 
   // ---------- WAV encoding ----------
   function resampleTo16k(buffer){
@@ -485,6 +589,7 @@
     enPending.classList.add('pending');
 
     const t0 = performance.now();
+    const sourceLang = sourceLangEl.value;
 
     const markFiltered = (el) => {
       el.classList.remove('pending');
@@ -495,7 +600,7 @@
     const transcribeTask = (async () => {
       const fd = new FormData();
       fd.append('file', wavBlob, 'chunk.wav');
-      fd.append('language', 'de');
+      fd.append('language', sourceLang);
       fd.append('translate', 'false');
       fd.append('response_format', 'text');
       const res = await fetch('/transcribe', {method:'POST', body: fd});
@@ -524,13 +629,13 @@
     // (two independent audio passes, same as before).
     const translateTask = (async () => {
       let text;
-      if (translateMode === 'llm'){
+      if (translateMode === 'llm' || translateMode === 'google'){
         const deText = await transcribeTask; // rejects with HallucinationSkip if filtered above
         const tS = performance.now();
         const res = await fetch('/translate', {
           method:'POST',
           headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({text: deText})
+          body: JSON.stringify({text: deText, sourceLang})
         });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         text = (await res.text()).trim();
@@ -541,7 +646,7 @@
       } else {
         const fd = new FormData();
         fd.append('file', wavBlob, 'chunk.wav');
-        fd.append('language', 'de');
+        fd.append('language', sourceLang);
         fd.append('translate', 'true');
         fd.append('response_format', 'text');
         const res = await fetch('/translate', {method:'POST', body: fd});
@@ -610,7 +715,17 @@
     if (!ok && !confirm('Server not reachable right now. Start recording anyway?')) return;
 
     try{
-      mediaStream = await navigator.mediaDevices.getUserMedia({audio:{channelCount:1, echoCancellation:false, noiseSuppression:false, autoGainControl:false}});
+      const deviceId = micSelect.value;
+      const constraints = {
+        audio: {
+          channelCount: 1,
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          ...(deviceId ? { deviceId: { exact: deviceId } } : {})
+        }
+      };
+      mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
     }catch(e){
       alert('Could not access microphone: ' + e.message);
       return;
@@ -640,7 +755,7 @@
       const localChunks = [];
       recorder.ondataavailable = e => { if (e.data.size > 0) localChunks.push(e.data); };
       recorder.onstop = async () => {
-        sourceNode.disconnect(dest);
+        try { sourceNode.disconnect(dest); } catch (e) { /* already torn down by the browser — harmless */ }
         const avgEnergy = chunkEnergySamples ? (chunkEnergySum / chunkEnergySamples) : 0;
         if (avgEnergy < SILENCE_THRESHOLD){
           footerLeft.textContent = `chunk skipped — silence (energy ${avgEnergy.toFixed(1)}) · ${fmtTime()}`;
@@ -682,6 +797,7 @@
 
   startBtn.addEventListener('click', start);
   stopBtn.addEventListener('click', stop);
+  $('refreshMicBtn').addEventListener('click', populateMicDevices);
   clearBtn.addEventListener('click', () => {
     deTranscript.querySelectorAll('.line').forEach(l => l.remove());
     enTranscript.querySelectorAll('.line').forEach(l => l.remove());
