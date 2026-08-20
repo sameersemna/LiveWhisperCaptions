@@ -302,13 +302,11 @@
     </select>
   </div>
   <div class="field">
-    <label for="chunkLen">Chunk length</label>
+    <label for="chunkLen">Max segment length</label>
     <select id="chunkLen">
-      <option value="3">3s</option>
-      <option value="4" selected>4s</option>
-      <option value="5">5s</option>
+      <option value="6">6s</option>
       <option value="8">8s</option>
-      <option value="12">12s</option>
+      <option value="12" selected>12s</option>
       <option value="20">20s</option>
     </select>
   </div>
@@ -394,30 +392,26 @@
     jackCursor++;
   }
 
-  let audioCtx, mediaStream, analyser, sourceNode, procNode;
+  let audioCtx, mediaStream, analyser, sourceNode, procNode, silentGain;
   let running = false;
-  let chunkTimer = null;
   let levelRaf = null;
   let liveEnergy = 0;
-  // One accumulator per in-flight chunk recorder. Recorders overlap (see OVERLAP_SECONDS),
-  // so a single global sum would be reset by the next chunk mid-way through the current one
-  // and wreck the silence gate. Each recorder owns its own {sum, n}; the level meter feeds
-  // every accumulator that's currently open.
-  const activeMeters = new Set();
-  const activeRecorders = new Set();
-
-  // One decode context for the page lifetime. Building and closing an AudioContext per chunk
-  // costs tens of ms every few seconds, and it has to outlive stop() so the final chunk can
-  // still be decoded after the capture context is torn down.
-  let decodeCtx = null;
-  const getDecodeCtx = () => (decodeCtx ||= new (window.AudioContext || window.webkitAudioContext)());
 
   const SILENCE_THRESHOLD = 6; // avg byte-frequency level (0-255); tune using the live "lvl:" readout in the header
-  // Next recorder starts this many seconds before the current one stops, so (a) capture is
-  // never gapped while a chunk is being decoded/encoded, and (b) a word straddling the
-  // boundary is whole in at least one chunk. Costs some duplicated words at chunk seams —
-  // set to 0 to trade that back for clipped boundaries.
-  const OVERLAP_SECONDS = 0.5;
+
+  // ---------- VAD endpointer ----------
+  // Capture is one continuous PCM stream for the whole call (via a ScriptProcessorNode,
+  // see start()); this state machine decides where to cut it into chunks to send, using the
+  // same avg frequency-domain energy metric as SILENCE_THRESHOLD/the level meter above —
+  // one threshold, one number to tune, both places.
+  const HANGOVER_MS = 600;      // trailing silence required after speech before cutting a chunk
+  const MIN_SPEECH_MS = 250;    // ignore blips shorter than this — not worth a round trip
+  const IDLE_RESET_MS = 2000;   // drop accumulated pure-silence audio after this long (bounds memory)
+  let segFrames = [];           // Float32Array pieces captured since the last cut
+  let segHasSpeech = false;
+  let segSpeechMs = 0, segSilenceMs = 0, segMs = 0;
+  let vadLastTs = null;
+
   const energyReadout = $('energyReadout');
 
   // Known Whisper hallucination boilerplate — German broadcaster/subtitle credit lines
@@ -597,6 +591,32 @@
     return new Blob([view], {type:'audio/wav'});
   }
 
+  // Concatenates the raw PCM captured since the last cut, resamples/encodes it, and sends
+  // it — or just drops it if the VAD loop decided this stretch was silence. Builds a
+  // buffer-like object (sampleRate/numberOfChannels/getChannelData) rather than a real
+  // AudioBuffer so resampleTo16k can stay as-is; there's no decodeAudioData step any more
+  // since capture is already raw PCM, not an encoded container.
+  function flushSegment(send){
+    const frames = segFrames;
+    segFrames = [];
+    segHasSpeech = false;
+    segSpeechMs = 0; segSilenceMs = 0; segMs = 0;
+    if (!send || !frames.length) return;
+
+    let total = 0;
+    for (const f of frames) total += f.length;
+    const merged = new Float32Array(total);
+    let off = 0;
+    for (const f of frames){ merged.set(f, off); off += f.length; }
+
+    const mono16k = resampleTo16k({
+      sampleRate: audioCtx.sampleRate,
+      numberOfChannels: 1,
+      getChannelData: () => merged,
+    });
+    sendChunk(encodeWav(mono16k, 16000));
+  }
+
   class HallucinationSkip extends Error {}
 
   // whisper.cpp re-decodes a segment at escalating temperatures whenever its
@@ -723,7 +743,6 @@
       let sum = 0;
       for (let i=0;i<data.length;i++) sum += data[i];
       const avg = sum / data.length; // 0..255
-      for (const m of activeMeters){ m.sum += avg; m.n++; }
       liveEnergy = avg;
       energyReadout.textContent = 'lvl: ' + avg.toFixed(1);
       energyReadout.style.color = avg < SILENCE_THRESHOLD ? 'var(--text-faint)' : 'var(--green)';
@@ -734,6 +753,33 @@
         b.style.height = (on ? h : 15) + '%';
         b.style.background = on ? (avg > 130 ? 'var(--red)' : 'var(--green)') : 'var(--hairline)';
       });
+
+      // VAD tick — decide whether the segment accumulating in segFrames (via the
+      // ScriptProcessor in start()) should be cut now. Driven off the same avg energy
+      // reading as the meter/threshold above, using real elapsed time (rAF isn't fixed-rate).
+      const now = performance.now();
+      const dt = vadLastTs === null ? 0 : (now - vadLastTs);
+      vadLastTs = now;
+      if (running){
+        const maxSegmentMs = parseInt(chunkLenEl.value, 10) * 1000;
+        if (avg >= SILENCE_THRESHOLD){
+          segHasSpeech = true;
+          segSpeechMs += dt;
+          segSilenceMs = 0;
+        } else {
+          segSilenceMs += dt;
+        }
+        segMs += dt;
+
+        if (segHasSpeech && segSilenceMs >= HANGOVER_MS && segSpeechMs >= MIN_SPEECH_MS){
+          flushSegment(true);                          // natural end of utterance
+        } else if (segHasSpeech && segMs >= maxSegmentMs){
+          flushSegment(true);                          // safety cap — continuous speech, no pause
+        } else if (!segHasSpeech && segMs >= IDLE_RESET_MS){
+          flushSegment(false);                         // nothing but silence — drop it, bound memory
+        }
+      }
+
       levelRaf = requestAnimationFrame(draw);
     };
     draw();
@@ -771,49 +817,38 @@
     analyser = audioCtx.createAnalyser();
     analyser.fftSize = 256;
     sourceNode.connect(analyser);
-    startLevelMeter();
 
-    const chunkSeconds = parseInt(chunkLenEl.value, 10);
-    const overlap = Math.min(OVERLAP_SECONDS, chunkSeconds / 2);
-
-    const recordOneChunk = () => {
+    // Continuous raw-PCM capture for the whole call — no more per-chunk MediaRecorder
+    // start/stop cycling, so there's no capture gap to paper over and no encode/decode
+    // round trip before we can resample. The VAD loop in startLevelMeter()'s rAF tick
+    // decides when to cut segFrames into a chunk (see flushSegment()); this callback's
+    // only job is to keep appending raw samples to it.
+    //
+    // ScriptProcessorNode is deprecated in favor of AudioWorkletNode, but the worklet
+    // replacement needs its own module file (or a Blob-URL trick to fake one) — more
+    // moving parts for a project that's deliberately a single portable HTML file with no
+    // build step. ScriptProcessorNode still works in every browser this project targets;
+    // revisit only if that stops being true.
+    procNode = audioCtx.createScriptProcessor(4096, 1, 1);
+    procNode.onaudioprocess = (e) => {
       if (!running) return;
-      const dest = audioCtx.createMediaStreamDestination();
-      sourceNode.connect(dest);
-      const recorder = new MediaRecorder(dest.stream);
-      const meter = { sum: 0, n: 0 };
-      activeMeters.add(meter);
-      activeRecorders.add(recorder);
-      const localChunks = [];
-      recorder.ondataavailable = e => { if (e.data.size > 0) localChunks.push(e.data); };
-      recorder.onstop = async () => {
-        activeMeters.delete(meter);
-        activeRecorders.delete(recorder);
-        try { sourceNode.disconnect(dest); } catch (e) { /* already torn down by the browser — harmless */ }
-        const avgEnergy = meter.n ? (meter.sum / meter.n) : 0;
-        if (avgEnergy < SILENCE_THRESHOLD){
-          footerLeft.textContent = `chunk skipped — silence (energy ${avgEnergy.toFixed(1)}) · ${fmtTime()}`;
-          return;
-        }
-        const blob = new Blob(localChunks, {type: recorder.mimeType});
-        try{
-          const arrBuf = await blob.arrayBuffer();
-          const audioBuf = await getDecodeCtx().decodeAudioData(arrBuf);
-          const mono16k = resampleTo16k(audioBuf);
-          sendChunk(encodeWav(mono16k, 16000));
-        }catch(err){
-          footerLeft.textContent = 'decode error: ' + err.message;
-        }
-      };
-      recorder.start();
-      // Start the successor slightly *before* this one stops. Two things fall out of that:
-      // capture is never gapped while this chunk is decoded/encoded/sent (the old loop only
-      // restarted after that whole async tail finished), and a word landing on the seam is
-      // captured whole by at least one of the two chunks.
-      setTimeout(recordOneChunk, Math.max(0, chunkSeconds - overlap) * 1000);
-      setTimeout(() => { if (recorder.state !== 'inactive') recorder.stop(); }, chunkSeconds * 1000);
+      segFrames.push(new Float32Array(e.inputBuffer.getChannelData(0)));
     };
-    recordOneChunk();
+    // ScriptProcessorNode only fires onaudioprocess while connected through to a
+    // destination. Route it through a silent gain rather than audioCtx.destination
+    // directly, so the mic audio is never actually played back out loud.
+    silentGain = audioCtx.createGain();
+    silentGain.gain.value = 0;
+    sourceNode.connect(procNode);
+    procNode.connect(silentGain);
+    silentGain.connect(audioCtx.destination);
+
+    segFrames = [];
+    segHasSpeech = false;
+    segSpeechMs = 0; segSilenceMs = 0; segMs = 0;
+    vadLastTs = null;
+
+    startLevelMeter();
   }
 
   function stop(){
@@ -823,12 +858,13 @@
     setDot(dotLive, null);
     setDot(dotMic, null);
     footerLeft.textContent = 'stopped';
-    // Flush anything still recording so the tail of the call gets transcribed now, rather
-    // than whenever its timer would have fired. Their onstop handlers decode against
-    // decodeCtx, which deliberately outlives audioCtx.
-    [...activeRecorders].forEach(r => { if (r.state !== 'inactive') r.stop(); });
+    // Send whatever speech was captured since the last cut immediately, rather than
+    // waiting on a hangover timer that will now never fire.
+    flushSegment(segHasSpeech);
     if (levelRaf) cancelAnimationFrame(levelRaf);
     bars.forEach(b => { b.style.height='15%'; b.style.background='var(--hairline)'; });
+    if (procNode){ procNode.onaudioprocess = null; procNode.disconnect(); procNode = null; }
+    if (silentGain){ silentGain.disconnect(); silentGain = null; }
     if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
     if (audioCtx) audioCtx.close();
   }
