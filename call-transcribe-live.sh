@@ -2,18 +2,26 @@
 # call-transcribe-live.sh
 # Live chunked transcription AND translation via Whisper server with VAD.
 # Uses ffmpeg segment muxer to write fixed-duration WAV chunks,
-# filters out silence using ffmpeg's silencedetect, then sends only
+# filters out silence using ffmpeg's silencedetect, then sends the
 # speech-containing chunks for transcription and translation.
 #
 # Requires: ffmpeg, curl
 #
-# Usage: ./call-transcribe-live.sh
+# Usage:
+#   ./call-transcribe-live.sh [LANG_CODE]
+#
+#   LANG_CODE  Source language (default: de). Examples: de, en, fr, es, it, nl...
+#
+# Example: ./call-transcribe-live.sh es   # Spanish source, translated to English
 # Press Ctrl+C to stop.
 
 # get environment variables from .env file
 if [ -f .env ]; then
   export $(cat .env | sed 's/#.*//g' | xargs)
 fi
+
+# Source language from CLI arg (default: de)
+LANGUAGE="${1:-de}"
 
 CHUNK_SECONDS=3
 # Silence detection: treat as silence if below -25dB for 0.3s+ (more aggressive)
@@ -90,11 +98,11 @@ process_chunk() {
     return 0
   fi
 
-  # Transcription (original language - German)
+  # Transcription (original language)
   local transcription
   transcription=$(curl -s "http://${WHISPER_HOST}/inference" \
     -F file="@$chunk_file" \
-    -F language="de" \
+    -F language="$LANGUAGE" \
     -F translate="false" \
     -F response_format="text")
 
@@ -102,7 +110,7 @@ process_chunk() {
   local translation
   translation=$(curl -s "http://${WHISPER_HOST}/inference" \
     -F file="@$chunk_file" \
-    -F language="de" \
+    -F language="$LANGUAGE" \
     -F translate="true" \
     -F response_format="text")
 
@@ -122,7 +130,7 @@ process_chunk() {
   done
 
   if [ "$trans_len" -ge "$MIN_TEXT_LENGTH" ] && [ -n "$transcription" ] && [ "$is_hallucination" -eq 0 ]; then
-    printf "\n[DE] %s\n" "$transcription"
+    printf "\n[%s] %s\n" "$LANGUAGE" "$transcription"
   fi
   if [ "$transl_len" -ge "$MIN_TEXT_LENGTH" ] && [ -n "$translation" ] && [ "$is_hallucination" -eq 0 ]; then
     printf "[EN] %s\n" "$translation"
@@ -131,7 +139,7 @@ process_chunk() {
 
 echo "Live transcription + translation started (${CHUNK_SECONDS}s chunks, VAD enabled). Press Ctrl+C to stop."
 echo "---"
-echo "[DE] = German transcription | [EN] = English translation"
+echo "[$LANGUAGE] = Source transcription | [EN] = English translation"
 echo ""
 
 # Use ffmpeg segment muxer to write fixed-duration chunk files directly.
