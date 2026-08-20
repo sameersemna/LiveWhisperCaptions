@@ -268,6 +268,7 @@
       <div class="status"><span class="dot" id="dotServer"></span>SERVER</div>
       <div class="status"><span class="dot" id="dotLive"></span>LIVE</div>
       <div class="meter" id="meter"></div>
+      <span id="energyReadout" style="font-family:var(--mono); font-size:10px; color:var(--text-faint); min-width:52px;">lvl: —</span>
     </div>
   </div>
   <div class="jack-strip" id="jackStrip"></div>
@@ -324,7 +325,7 @@
   const dotMic = $('dotMic'), dotServer = $('dotServer'), dotLive = $('dotLive');
   const deTranscript = $('deTranscript'), enTranscript = $('enTranscript');
   const deEmpty = $('deEmpty'), enEmpty = $('enEmpty');
-  const footerLeft = $('footerLeft'), serverCheck = $('serverCheck');
+  const footerLeft = $('footerLeft'), footerRight = $('footerRight'), serverCheck = $('serverCheck');
   const meterEl = $('meter'), jackStrip = $('jackStrip');
   const btHint = $('btHint');
 
@@ -345,10 +346,28 @@
 
   let audioCtx, mediaStream, analyser, sourceNode, procNode;
   let running = false;
-  let chunkBuffers = [];
-  let chunkSampleRate = 16000;
   let chunkTimer = null;
   let levelRaf = null;
+  let chunkEnergySum = 0, chunkEnergySamples = 0;
+  let liveEnergy = 0;
+  const SILENCE_THRESHOLD = 6; // avg byte-frequency level (0-255); tune using the live "lvl:" readout in the header
+  const energyReadout = $('energyReadout');
+
+  // Known Whisper hallucination boilerplate — German broadcaster/subtitle credit lines
+  // that models emit on silence or non-speech noise, same family as "Subtitles by the
+  // Amara.org community". Add more phrases here as you spot them in your own transcripts.
+  const HALLUCINATION_PATTERNS = [
+    /untertitel/i,
+    /amara\.org/i,
+    /copyright\s+(wdr|ndr|swr|zdf|br|mdr|rbb|hr|srf)/i,
+    /produziert.*(im auftrag|funk)/i,
+    /vielen dank f(ü|u)rs zuschauen/i,
+    /(like|abonnier).{0,20}(kanal|glocke)/i,
+    /bis zum n(ä|a)chsten mal/i,
+  ];
+  function looksHallucinated(text){
+    return HALLUCINATION_PATTERNS.some(re => re.test(text));
+  }
 
   function fmtTime(){
     const d = new Date();
@@ -384,11 +403,16 @@
       return false;
     }
   }
+  let translateMode = 'whisper';
   async function loadConfig(){
     try{
       const r = await fetch('/config');
       const cfg = await r.json();
       serverUrlEl.value = cfg.whisperUrl;
+      translateMode = cfg.translateMode || 'whisper';
+      footerRight.textContent = translateMode === 'llm'
+        ? `large-v3 · ollama translate (${cfg.ollamaModel})`
+        : 'large-v3 · dual whisper pass';
       if (cfg.btSource){
         btHint.textContent = `expects default input: ${cfg.btSource}`;
       }
@@ -450,6 +474,8 @@
     return new Blob([view], {type:'audio/wav'});
   }
 
+  class HallucinationSkip extends Error {}
+
   async function sendChunk(wavBlob){
     litJack();
 
@@ -458,31 +484,100 @@
     dePending.classList.add('pending');
     enPending.classList.add('pending');
 
-    const runRequest = async (translate) => {
+    const t0 = performance.now();
+
+    const markFiltered = (el) => {
+      el.classList.remove('pending');
+      el.querySelector('.txt').textContent = '· filtered (likely hallucination) ·';
+    };
+
+    // Always one Whisper pass: German audio -> German text.
+    const transcribeTask = (async () => {
       const fd = new FormData();
       fd.append('file', wavBlob, 'chunk.wav');
       fd.append('language', 'de');
-      fd.append('translate', translate ? 'true' : 'false');
+      fd.append('translate', 'false');
       fd.append('response_format', 'text');
-      const res = await fetch('/inference', {method:'POST', body:fd});
+      const res = await fetch('/transcribe', {method:'POST', body: fd});
       if (!res.ok) throw new Error('HTTP ' + res.status);
-      const txt = (await res.text()).trim();
-      return txt;
-    };
+      const text = (await res.text()).trim();
+      const ms = Math.round(performance.now() - t0);
+      dePending.querySelector('.ts').textContent += `  ·  ${ms}ms`;
+
+      if (looksHallucinated(text)){
+        markFiltered(dePending);
+        throw new HallucinationSkip();
+      }
+      dePending.classList.remove('pending');
+      dePending.querySelector('.txt').textContent = text || '·';
+      return text;
+    })().catch(err => {
+      if (!(err instanceof HallucinationSkip)){
+        dePending.classList.remove('pending');
+        dePending.querySelector('.txt').textContent = '[transcribe failed]';
+      }
+      throw err;
+    });
+
+    // Translation: LLM mode waits on the transcript (sequential, but cheap);
+    // whisper mode fires immediately in parallel with the transcribe request
+    // (two independent audio passes, same as before).
+    const translateTask = (async () => {
+      let text;
+      if (translateMode === 'llm'){
+        const deText = await transcribeTask; // rejects with HallucinationSkip if filtered above
+        const tS = performance.now();
+        const res = await fetch('/translate', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({text: deText})
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        text = (await res.text()).trim();
+        const ms = Math.round(performance.now() - tS);
+        enPending.classList.remove('pending');
+        enPending.querySelector('.txt').textContent = text || '·';
+        enPending.querySelector('.ts').textContent += `  ·  ${ms}ms`;
+      } else {
+        const fd = new FormData();
+        fd.append('file', wavBlob, 'chunk.wav');
+        fd.append('language', 'de');
+        fd.append('translate', 'true');
+        fd.append('response_format', 'text');
+        const res = await fetch('/translate', {method:'POST', body: fd});
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        text = (await res.text()).trim();
+        const ms = Math.round(performance.now() - t0);
+        enPending.querySelector('.ts').textContent += `  ·  ${ms}ms`;
+        if (looksHallucinated(text)){
+          markFiltered(enPending);
+          throw new HallucinationSkip();
+        }
+        enPending.classList.remove('pending');
+        enPending.querySelector('.txt').textContent = text || '·';
+      }
+    })().catch(err => {
+      if (err instanceof HallucinationSkip){
+        markFiltered(enPending); // covers llm-mode case where transcribeTask was filtered
+      } else {
+        enPending.classList.remove('pending');
+        enPending.querySelector('.txt').textContent = '[translate failed]';
+      }
+      throw err;
+    });
 
     try{
-      const [deText, enText] = await Promise.all([runRequest(false), runRequest(true)]);
+      await Promise.all([transcribeTask, translateTask]);
       setDot(dotServer, 'green');
-      dePending.classList.remove('pending');
-      enPending.classList.remove('pending');
-      dePending.querySelector('.txt').textContent = deText || '·';
-      enPending.querySelector('.txt').textContent = enText || '·';
-      footerLeft.textContent = 'last chunk ok · ' + fmtTime();
+      footerLeft.textContent = `last chunk ok · total ${Math.round(performance.now() - t0)}ms · ${fmtTime()}`;
     }catch(e){
-      setDot(dotServer, 'red');
-      dePending.querySelector('.txt').textContent = '[send failed]';
-      enPending.querySelector('.txt').textContent = '[send failed]';
-      footerLeft.textContent = 'error: ' + e.message;
+      if (e instanceof HallucinationSkip){
+        setDot(dotServer, 'green');
+        footerLeft.textContent = `chunk filtered — hallucination pattern (lvl ${liveEnergy.toFixed(1)}) · ${fmtTime()}`;
+      } else {
+        setDot(dotServer, 'red');
+        footerLeft.textContent = 'error: ' + e.message;
+      }
     }
   }
 
@@ -493,6 +588,11 @@
       let sum = 0;
       for (let i=0;i<data.length;i++) sum += data[i];
       const avg = sum / data.length; // 0..255
+      chunkEnergySum += avg;
+      chunkEnergySamples++;
+      liveEnergy = avg;
+      energyReadout.textContent = 'lvl: ' + avg.toFixed(1);
+      energyReadout.style.color = avg < SILENCE_THRESHOLD ? 'var(--text-faint)' : 'var(--green)';
       const activeCount = Math.round((avg/255) * BAR_COUNT * 1.6);
       bars.forEach((b,i) => {
         const on = i < activeCount;
@@ -532,6 +632,8 @@
     const chunkSeconds = parseInt(chunkLenEl.value, 10);
     const recordOneChunk = () => {
       if (!running) return;
+      chunkEnergySum = 0;
+      chunkEnergySamples = 0;
       const dest = audioCtx.createMediaStreamDestination();
       sourceNode.connect(dest);
       const recorder = new MediaRecorder(dest.stream);
@@ -539,6 +641,12 @@
       recorder.ondataavailable = e => { if (e.data.size > 0) localChunks.push(e.data); };
       recorder.onstop = async () => {
         sourceNode.disconnect(dest);
+        const avgEnergy = chunkEnergySamples ? (chunkEnergySum / chunkEnergySamples) : 0;
+        if (avgEnergy < SILENCE_THRESHOLD){
+          footerLeft.textContent = `chunk skipped — silence (energy ${avgEnergy.toFixed(1)}) · ${fmtTime()}`;
+          if (running) recordOneChunk();
+          return;
+        }
         const blob = new Blob(localChunks, {type: recorder.mimeType});
         try{
           const arrBuf = await blob.arrayBuffer();

@@ -1,8 +1,9 @@
 #!/bin/bash
 # call-transcribe-live.sh
-# Live chunked transcription AND translation via Whisper server.
+# Live chunked transcription AND translation via Whisper server with VAD.
 # Uses ffmpeg segment muxer to write fixed-duration WAV chunks,
-# then sends each chunk for both transcription (original) and translation.
+# filters out silence using ffmpeg's silencedetect, then sends only
+# speech-containing chunks for transcription and translation.
 #
 # Requires: ffmpeg, curl
 #
@@ -15,6 +16,15 @@ if [ -f .env ]; then
 fi
 
 CHUNK_SECONDS=3
+# Silence detection: treat as silence if below -25dB for 0.3s+ (more aggressive)
+SILENCE_THRESHOLD_DB=-25
+SILENCE_DURATION=0.3
+# Also check mean_volume - if average < -40dB, consider it silence
+RMS_THRESHOLD_DB=-40
+# Minimum transcription length to avoid hallucinations
+MIN_TEXT_LENGTH=20
+# Common Whisper hallucinations to filter out (case-insensitive)
+HALLUCINATIONS=("vielen dank" "subtitles by" "amara.org" "danke" "danke schön" "ende" "the end" "thank you" "thanks" "subtitle" "community")
 BASENAME="call_live_$(date +%s)"
 TMPDIR="/tmp/${BASENAME}_chunks"
 mkdir -p "$TMPDIR"
@@ -28,9 +38,57 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# Check if a chunk contains speech (not just silence)
+# Returns 0 (true) if speech detected, 1 (false) if silence
+has_speech() {
+  local chunk_file="$1"
+  local idx="$2"
+
+  # Method 1: volumedetect for mean_volume (RMS equivalent)
+  local vol_info
+  vol_info=$(ffmpeg -hide_banner -loglevel error -i "$chunk_file" \
+    -af "volumedetect" -f null - 2>&1)
+
+  local mean_volume
+  mean_volume=$(echo "$vol_info" | grep -oP 'mean_volume:\s*\K[-]?[\d.]+' | head -1)
+
+  if [ -n "$mean_volume" ]; then
+    # mean_volume is negative dB, more negative = quieter
+    if (( $(echo "$mean_volume < $RMS_THRESHOLD_DB" | bc -l 2>/dev/null || echo 0) )); then
+      return 1
+    fi
+  fi
+
+  # Method 2: silencedetect as backup
+  local silence_info
+  silence_info=$(ffmpeg -hide_banner -loglevel error -i "$chunk_file" \
+    -af "silencedetect=noise=${SILENCE_THRESHOLD_DB}dB:d=${SILENCE_DURATION}" \
+    -f null - 2>&1)
+
+  # If silencedetect found silence spanning most of the chunk, skip it
+  if echo "$silence_info" | grep -q "silence_end"; then
+    local silence_dur
+    silence_dur=$(echo "$silence_info" | grep -oP 'silence_duration: \K[\d.]+' | head -1)
+    if [ -n "$silence_dur" ]; then
+      local threshold
+      threshold=$(echo "$CHUNK_SECONDS * 0.8" | bc -l 2>/dev/null || echo "2.4")
+      if (( $(echo "$silence_dur >= $threshold" | bc -l 2>/dev/null || echo 0) )); then
+        return 1
+      fi
+    fi
+  fi
+  return 0
+}
+
 process_chunk() {
   local chunk_file="$1"
+  local idx="$2"
   [ -s "$chunk_file" ] || return 0
+
+  # Skip if chunk is mostly silence (prevents Whisper hallucinations)
+  if ! has_speech "$chunk_file" "$idx"; then
+    return 0
+  fi
 
   # Transcription (original language - German)
   local transcription
@@ -48,19 +106,35 @@ process_chunk() {
     -F translate="true" \
     -F response_format="text")
 
-  if [ -n "$transcription" ]; then
+  # Filter out very short results (likely hallucinations)
+  local trans_len=${#transcription}
+  local transl_len=${#translation}
+  
+  # Check for known hallucination patterns
+  local is_hallucination=0
+  local lower_trans=$(echo "$transcription" | tr '[:upper:]' '[:lower:]')
+  local lower_transl=$(echo "$translation" | tr '[:upper:]' '[:lower:]')
+  for pattern in "${HALLUCINATIONS[@]}"; do
+    if [[ "$lower_trans" == *"$pattern"* ]] || [[ "$lower_transl" == *"$pattern"* ]]; then
+      is_hallucination=1
+      break
+    fi
+  done
+
+  if [ "$trans_len" -ge "$MIN_TEXT_LENGTH" ] && [ -n "$transcription" ] && [ "$is_hallucination" -eq 0 ]; then
     printf "\n[DE] %s\n" "$transcription"
   fi
-  if [ -n "$translation" ]; then
+  if [ "$transl_len" -ge "$MIN_TEXT_LENGTH" ] && [ -n "$translation" ] && [ "$is_hallucination" -eq 0 ]; then
     printf "[EN] %s\n" "$translation"
   fi
 }
 
-echo "Live transcription + translation started (${CHUNK_SECONDS}s chunks). Press Ctrl+C to stop."
+echo "Live transcription + translation started (${CHUNK_SECONDS}s chunks, VAD enabled). Press Ctrl+C to stop."
 echo "---"
+echo "[DE] = German transcription | [EN] = English translation"
+echo ""
 
 # Use ffmpeg segment muxer to write fixed-duration chunk files directly.
-# This avoids complex stream management - each chunk is a complete file.
 ffmpeg -loglevel error \
   -f pulse -i "$BT_SOURCE" \
   -ar 16000 -ac 1 -acodec pcm_s16le \
@@ -84,7 +158,7 @@ while true; do
 
   # Wait for this chunk file to exist and have content
   if [ -f "$CHUNK_FILE" ] && [ -s "$CHUNK_FILE" ]; then
-    process_chunk "$CHUNK_FILE" &
+    process_chunk "$CHUNK_FILE" "$CHUNK_IDX" &
     CHUNK_IDX=$((CHUNK_IDX + 1))
   else
     # File not ready yet, brief wait
