@@ -304,8 +304,10 @@
   <div class="field">
     <label for="chunkLen">Chunk length</label>
     <select id="chunkLen">
+      <option value="3">3s</option>
+      <option value="4" selected>4s</option>
       <option value="5">5s</option>
-      <option value="8" selected>8s</option>
+      <option value="8">8s</option>
       <option value="12">12s</option>
       <option value="20">20s</option>
     </select>
@@ -396,9 +398,26 @@
   let running = false;
   let chunkTimer = null;
   let levelRaf = null;
-  let chunkEnergySum = 0, chunkEnergySamples = 0;
   let liveEnergy = 0;
+  // One accumulator per in-flight chunk recorder. Recorders overlap (see OVERLAP_SECONDS),
+  // so a single global sum would be reset by the next chunk mid-way through the current one
+  // and wreck the silence gate. Each recorder owns its own {sum, n}; the level meter feeds
+  // every accumulator that's currently open.
+  const activeMeters = new Set();
+  const activeRecorders = new Set();
+
+  // One decode context for the page lifetime. Building and closing an AudioContext per chunk
+  // costs tens of ms every few seconds, and it has to outlive stop() so the final chunk can
+  // still be decoded after the capture context is torn down.
+  let decodeCtx = null;
+  const getDecodeCtx = () => (decodeCtx ||= new (window.AudioContext || window.webkitAudioContext)());
+
   const SILENCE_THRESHOLD = 6; // avg byte-frequency level (0-255); tune using the live "lvl:" readout in the header
+  // Next recorder starts this many seconds before the current one stops, so (a) capture is
+  // never gapped while a chunk is being decoded/encoded, and (b) a word straddling the
+  // boundary is whole in at least one chunk. Costs some duplicated words at chunk seams —
+  // set to 0 to trade that back for clipped boundaries.
+  const OVERLAP_SECONDS = 0.5;
   const energyReadout = $('energyReadout');
 
   // Known Whisper hallucination boilerplate — German broadcaster/subtitle credit lines
@@ -580,6 +599,15 @@
 
   class HallucinationSkip extends Error {}
 
+  // whisper.cpp re-decodes a segment at escalating temperatures whenever its
+  // compression-ratio / avg-logprob checks fail — which is often on noisy 8 kHz HFP audio,
+  // and can multiply decode time on exactly the chunks that are already slowest.
+  // temperature_inc=0 disables that fallback loop: one greedy pass, bounded latency.
+  function applyDecodeParams(fd){
+    fd.append('temperature', '0');
+    fd.append('temperature_inc', '0');
+  }
+
   async function sendChunk(wavBlob){
     litJack();
 
@@ -603,6 +631,7 @@
       fd.append('language', sourceLang);
       fd.append('translate', 'false');
       fd.append('response_format', 'text');
+      applyDecodeParams(fd);
       const res = await fetch('/transcribe', {method:'POST', body: fd});
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const text = (await res.text()).trim();
@@ -649,6 +678,7 @@
         fd.append('language', sourceLang);
         fd.append('translate', 'true');
         fd.append('response_format', 'text');
+        applyDecodeParams(fd);
         const res = await fetch('/translate', {method:'POST', body: fd});
         if (!res.ok) throw new Error('HTTP ' + res.status);
         text = (await res.text()).trim();
@@ -693,8 +723,7 @@
       let sum = 0;
       for (let i=0;i<data.length;i++) sum += data[i];
       const avg = sum / data.length; // 0..255
-      chunkEnergySum += avg;
-      chunkEnergySamples++;
+      for (const m of activeMeters){ m.sum += avg; m.n++; }
       liveEnergy = avg;
       energyReadout.textContent = 'lvl: ' + avg.toFixed(1);
       energyReadout.style.color = avg < SILENCE_THRESHOLD ? 'var(--text-faint)' : 'var(--green)';
@@ -745,38 +774,43 @@
     startLevelMeter();
 
     const chunkSeconds = parseInt(chunkLenEl.value, 10);
+    const overlap = Math.min(OVERLAP_SECONDS, chunkSeconds / 2);
+
     const recordOneChunk = () => {
       if (!running) return;
-      chunkEnergySum = 0;
-      chunkEnergySamples = 0;
       const dest = audioCtx.createMediaStreamDestination();
       sourceNode.connect(dest);
       const recorder = new MediaRecorder(dest.stream);
+      const meter = { sum: 0, n: 0 };
+      activeMeters.add(meter);
+      activeRecorders.add(recorder);
       const localChunks = [];
       recorder.ondataavailable = e => { if (e.data.size > 0) localChunks.push(e.data); };
       recorder.onstop = async () => {
+        activeMeters.delete(meter);
+        activeRecorders.delete(recorder);
         try { sourceNode.disconnect(dest); } catch (e) { /* already torn down by the browser — harmless */ }
-        const avgEnergy = chunkEnergySamples ? (chunkEnergySum / chunkEnergySamples) : 0;
+        const avgEnergy = meter.n ? (meter.sum / meter.n) : 0;
         if (avgEnergy < SILENCE_THRESHOLD){
           footerLeft.textContent = `chunk skipped — silence (energy ${avgEnergy.toFixed(1)}) · ${fmtTime()}`;
-          if (running) recordOneChunk();
           return;
         }
         const blob = new Blob(localChunks, {type: recorder.mimeType});
         try{
           const arrBuf = await blob.arrayBuffer();
-          const decodeCtx = new (window.AudioContext || window.webkitAudioContext)();
-          const audioBuf = await decodeCtx.decodeAudioData(arrBuf);
+          const audioBuf = await getDecodeCtx().decodeAudioData(arrBuf);
           const mono16k = resampleTo16k(audioBuf);
-          const wav = encodeWav(mono16k, 16000);
-          decodeCtx.close();
-          sendChunk(wav);
+          sendChunk(encodeWav(mono16k, 16000));
         }catch(err){
           footerLeft.textContent = 'decode error: ' + err.message;
         }
-        if (running) recordOneChunk();
       };
       recorder.start();
+      // Start the successor slightly *before* this one stops. Two things fall out of that:
+      // capture is never gapped while this chunk is decoded/encoded/sent (the old loop only
+      // restarted after that whole async tail finished), and a word landing on the seam is
+      // captured whole by at least one of the two chunks.
+      setTimeout(recordOneChunk, Math.max(0, chunkSeconds - overlap) * 1000);
       setTimeout(() => { if (recorder.state !== 'inactive') recorder.stop(); }, chunkSeconds * 1000);
     };
     recordOneChunk();
@@ -789,6 +823,10 @@
     setDot(dotLive, null);
     setDot(dotMic, null);
     footerLeft.textContent = 'stopped';
+    // Flush anything still recording so the tail of the call gets transcribed now, rather
+    // than whenever its timer would have fired. Their onstop handlers decode against
+    // decodeCtx, which deliberately outlives audioCtx.
+    [...activeRecorders].forEach(r => { if (r.state !== 'inactive') r.stop(); });
     if (levelRaf) cancelAnimationFrame(levelRaf);
     bars.forEach(b => { b.style.height='15%'; b.style.background='var(--hairline)'; });
     if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
