@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Vermittlung — Live Call Console</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Sans:ital@1&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg: #12151a;
+    --panel: #1a1e25;
+    --panel-raised: #1f242c;
+    --hairline: #2a3038;
+    --text: #e7e5df;
+    --text-muted: #7a8390;
+    --text-faint: #4a515c;
+    --amber: #e8a33d;
+    --amber-dim: #6b5327;
+    --green: #5fae6d;
+    --green-dim: #2c4630;
+    --red: #d9695f;
+    --de: #8aa4c4;
+    --en: #e8dcc8;
+    --mono: 'JetBrains Mono', 'Consolas', monospace;
+    --sans: 'IBM Plex Sans', system-ui, sans-serif;
+  }
+  *{box-sizing:border-box;}
+  html,body{height:100%;}
+  body{
+    margin:0;
+    background:
+      radial-gradient(ellipse at top, #171b21 0%, var(--bg) 55%);
+    color:var(--text);
+    font-family:var(--sans);
+    display:flex;
+    flex-direction:column;
+    min-height:100vh;
+  }
+
+  /* ---------- Header / patch panel ---------- */
+  header{
+    padding:22px 28px 16px;
+    border-bottom:1px solid var(--hairline);
+    background:linear-gradient(180deg, rgba(255,255,255,0.02), transparent);
+  }
+  .title-row{
+    display:flex;
+    align-items:baseline;
+    justify-content:space-between;
+    flex-wrap:wrap;
+    gap:12px;
+  }
+  h1{
+    font-family:var(--mono);
+    font-size:15px;
+    letter-spacing:0.14em;
+    text-transform:uppercase;
+    font-weight:700;
+    margin:0;
+    color:var(--text);
+  }
+  h1 span{color:var(--amber);}
+  .subtitle{
+    font-family:var(--mono);
+    font-size:11px;
+    color:var(--text-faint);
+    letter-spacing:0.05em;
+    margin-top:4px;
+  }
+  .status-cluster{
+    display:flex;
+    align-items:center;
+    gap:18px;
+    font-family:var(--mono);
+    font-size:11px;
+    color:var(--text-muted);
+  }
+  .status{display:flex;align-items:center;gap:7px;}
+  .dot{
+    width:7px;height:7px;border-radius:50%;
+    background:var(--text-faint);
+    box-shadow:0 0 0 3px rgba(255,255,255,0.03);
+    transition:background .2s, box-shadow .2s;
+  }
+  .dot.on-green{background:var(--green); box-shadow:0 0 8px 1px rgba(95,174,109,.6);}
+  .dot.on-amber{background:var(--amber); box-shadow:0 0 8px 1px rgba(232,163,61,.65); animation:pulse 1.1s ease-in-out infinite;}
+  .dot.on-red{background:var(--red); box-shadow:0 0 8px 1px rgba(217,105,95,.6);}
+  @keyframes pulse{ 0%,100%{opacity:1;} 50%{opacity:.35;} }
+
+  /* jack strip signature element */
+  .jack-strip{
+    display:flex;
+    gap:4px;
+    margin-top:16px;
+  }
+  .jack{
+    width:100%;
+    height:5px;
+    border-radius:1px;
+    background:var(--hairline);
+    transition:background .25s, box-shadow .25s;
+  }
+  .jack.lit{
+    background:var(--amber);
+    box-shadow:0 0 6px 0 rgba(232,163,61,.7);
+  }
+
+  /* ---------- Controls ---------- */
+  .controls{
+    display:flex;
+    align-items:flex-end;
+    gap:20px;
+    flex-wrap:wrap;
+    padding:18px 28px;
+    background:var(--panel);
+    border-bottom:1px solid var(--hairline);
+  }
+  .field{display:flex; flex-direction:column; gap:6px;}
+  .field label{
+    font-family:var(--mono);
+    font-size:10px;
+    letter-spacing:.1em;
+    text-transform:uppercase;
+    color:var(--text-faint);
+  }
+  input[type=text], select{
+    background:var(--panel-raised);
+    border:1px solid var(--hairline);
+    color:var(--text);
+    font-family:var(--mono);
+    font-size:12.5px;
+    padding:8px 10px;
+    border-radius:3px;
+    outline:none;
+    min-width:220px;
+  }
+  select{min-width:110px;}
+  input[type=text]:focus, select:focus{border-color:var(--amber);}
+  .btn{
+    font-family:var(--mono);
+    font-size:11.5px;
+    letter-spacing:.08em;
+    text-transform:uppercase;
+    font-weight:700;
+    padding:10px 20px;
+    border-radius:3px;
+    border:1px solid transparent;
+    cursor:pointer;
+    transition:transform .08s, filter .15s;
+  }
+  .btn:active{transform:translateY(1px);}
+  .btn-start{background:var(--green); color:#0d1510;}
+  .btn-start:hover{filter:brightness(1.08);}
+  .btn-stop{background:var(--red); color:#1a0d0b;}
+  .btn-stop:hover{filter:brightness(1.08);}
+  .btn:disabled{background:var(--hairline); color:var(--text-faint); cursor:not-allowed;}
+  .btn-ghost{
+    background:transparent; border-color:var(--hairline); color:var(--text-muted);
+  }
+  .btn-ghost:hover{border-color:var(--text-muted); color:var(--text);}
+
+  .meter{
+    display:flex; align-items:flex-end; gap:2px; height:22px; margin-left:4px;
+  }
+  .meter i{
+    display:block; width:3px; background:var(--hairline); border-radius:1px;
+    height:20%; transition:height .06s linear, background .06s linear;
+  }
+
+  /* ---------- Transcript panes ---------- */
+  main{
+    flex:1;
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:1px;
+    background:var(--hairline);
+    overflow:hidden;
+  }
+  .pane{
+    background:var(--bg);
+    display:flex;
+    flex-direction:column;
+    min-height:0;
+  }
+  .pane-head{
+    padding:14px 24px;
+    font-family:var(--mono);
+    font-size:11px;
+    letter-spacing:.14em;
+    text-transform:uppercase;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    border-bottom:1px solid var(--hairline);
+  }
+  .pane-head.de{color:var(--de);}
+  .pane-head.en{color:var(--en);}
+  .pane-head .flag{font-size:10px; color:var(--text-faint); letter-spacing:.05em;}
+  .transcript{
+    flex:1;
+    overflow-y:auto;
+    padding:18px 24px 40px;
+    display:flex;
+    flex-direction:column;
+    gap:16px;
+  }
+  .transcript::-webkit-scrollbar{width:8px;}
+  .transcript::-webkit-scrollbar-thumb{background:var(--hairline); border-radius:4px;}
+
+  .line{max-width:92%;}
+  .line .ts{
+    font-family:var(--mono);
+    font-size:10px;
+    color:var(--text-faint);
+    margin-bottom:4px;
+    letter-spacing:.05em;
+  }
+  .line .txt{
+    font-size:15.5px;
+    line-height:1.55;
+  }
+  .pane-head.de ~ .transcript .line .txt{color:var(--de);}
+  .en-text{color:var(--en);}
+  .de-text{color:var(--de);}
+  .line.pending .txt{color:var(--text-faint); font-style:italic;}
+
+  .empty-state{
+    margin:auto;
+    text-align:center;
+    color:var(--text-faint);
+    font-family:var(--mono);
+    font-size:12px;
+    letter-spacing:.05em;
+    max-width:280px;
+    line-height:1.7;
+  }
+
+  footer{
+    padding:10px 28px;
+    border-top:1px solid var(--hairline);
+    font-family:var(--mono);
+    font-size:10.5px;
+    color:var(--text-faint);
+    display:flex;
+    justify-content:space-between;
+    background:var(--panel);
+  }
+
+  @media (max-width: 760px){
+    main{grid-template-columns:1fr;}
+    .controls{gap:14px;}
+    input[type=text]{min-width:160px;}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="title-row">
+    <div>
+      <h1>VERMITTLUNG <span>// live call console</span></h1>
+      <div class="subtitle">deutsch → english · nothing recorded is saved to disk</div>
+      <div class="subtitle" id="btHint" style="margin-top:2px;"></div>
+    </div>
+    <div class="status-cluster">
+      <div class="status"><span class="dot" id="dotMic"></span>MIC</div>
+      <div class="status"><span class="dot" id="dotServer"></span>SERVER</div>
+      <div class="status"><span class="dot" id="dotLive"></span>LIVE</div>
+      <div class="meter" id="meter"></div>
+    </div>
+  </div>
+  <div class="jack-strip" id="jackStrip"></div>
+</header>
+
+<div class="controls">
+  <div class="field">
+    <label>Whisper server (proxied)</label>
+    <input type="text" id="serverUrl" value="loading…" spellcheck="false" readonly style="color:var(--text-muted); cursor:default;">
+  </div>
+  <div class="field">
+    <label for="chunkLen">Chunk length</label>
+    <select id="chunkLen">
+      <option value="5">5s</option>
+      <option value="8" selected>8s</option>
+      <option value="12">12s</option>
+      <option value="20">20s</option>
+    </select>
+  </div>
+  <button class="btn btn-start" id="startBtn">Start call</button>
+  <button class="btn btn-stop" id="stopBtn" disabled>Stop</button>
+  <button class="btn btn-ghost" id="clearBtn">Clear transcript</button>
+  <div class="field" style="margin-left:auto;">
+    <label>&nbsp;</label>
+    <span id="serverCheck" style="font-family:var(--mono); font-size:11px; color:var(--text-faint);">not checked</span>
+  </div>
+</div>
+
+<main>
+  <div class="pane">
+    <div class="pane-head de"><span>Deutsch — original</span><span class="flag">DE</span></div>
+    <div class="transcript" id="deTranscript">
+      <div class="empty-state" id="deEmpty">Press <b>Start call</b> once your Bluetooth<br>source is set as the default input.<br>German text appears here as it's heard.</div>
+    </div>
+  </div>
+  <div class="pane">
+    <div class="pane-head en"><span>English — translation</span><span class="flag">EN</span></div>
+    <div class="transcript" id="enTranscript">
+      <div class="empty-state" id="enEmpty">The English translation of each<br>chunk streams in here, a few<br>seconds behind the German.</div>
+    </div>
+  </div>
+</main>
+
+<footer>
+  <span id="footerLeft">idle</span>
+  <span id="footerRight">whisper.cpp · large-v3</span>
+</footer>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const serverUrlEl = $('serverUrl'), chunkLenEl = $('chunkLen');
+  const startBtn = $('startBtn'), stopBtn = $('stopBtn'), clearBtn = $('clearBtn');
+  const dotMic = $('dotMic'), dotServer = $('dotServer'), dotLive = $('dotLive');
+  const deTranscript = $('deTranscript'), enTranscript = $('enTranscript');
+  const deEmpty = $('deEmpty'), enEmpty = $('enEmpty');
+  const footerLeft = $('footerLeft'), serverCheck = $('serverCheck');
+  const meterEl = $('meter'), jackStrip = $('jackStrip');
+  const btHint = $('btHint');
+
+  // build meter bars + jack strip
+  const BAR_COUNT = 28, JACK_COUNT = 40;
+  for (let i=0;i<BAR_COUNT;i++){ const b=document.createElement('i'); meterEl.appendChild(b); }
+  const bars = [...meterEl.children];
+  for (let i=0;i<JACK_COUNT;i++){ const j=document.createElement('div'); j.className='jack'; jackStrip.appendChild(j); }
+  const jacks = [...jackStrip.children];
+  let jackCursor = 0;
+
+  function litJack(){
+    jacks[jackCursor % JACK_COUNT].classList.add('lit');
+    const fade = jackCursor;
+    setTimeout(()=> jacks[fade % JACK_COUNT].classList.remove('lit'), 900);
+    jackCursor++;
+  }
+
+  let audioCtx, mediaStream, analyser, sourceNode, procNode;
+  let running = false;
+  let chunkBuffers = [];
+  let chunkSampleRate = 16000;
+  let chunkTimer = null;
+  let levelRaf = null;
+
+  function fmtTime(){
+    const d = new Date();
+    return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  }
+
+  function addLine(pane, emptyEl, text, cls){
+    emptyEl.style.display = 'none';
+    const line = document.createElement('div');
+    line.className = 'line';
+    line.innerHTML = `<div class="ts">${fmtTime()}</div><div class="txt ${cls}">${text.replace(/</g,'&lt;')}</div>`;
+    pane.appendChild(line);
+    pane.scrollTop = pane.scrollHeight;
+    return line;
+  }
+
+  function setDot(el, state){
+    el.className = 'dot' + (state ? ' on-' + state : '');
+  }
+
+  async function checkServer(){
+    try{
+      const r = await fetch('/health');
+      const ok = r.ok;
+      setDot(dotServer, ok ? 'green' : 'red');
+      serverCheck.textContent = ok ? 'whisper server reachable' : 'whisper server unreachable';
+      serverCheck.style.color = ok ? 'var(--green)' : 'var(--red)';
+      return ok;
+    }catch(e){
+      setDot(dotServer, 'red');
+      serverCheck.textContent = 'proxy unreachable';
+      serverCheck.style.color = 'var(--red)';
+      return false;
+    }
+  }
+  async function loadConfig(){
+    try{
+      const r = await fetch('/config');
+      const cfg = await r.json();
+      serverUrlEl.value = cfg.whisperUrl;
+      if (cfg.btSource){
+        btHint.textContent = `expects default input: ${cfg.btSource}`;
+      }
+    }catch(e){
+      serverUrlEl.value = '(could not load config)';
+    }
+  }
+  loadConfig();
+  checkServer();
+
+  // ---------- WAV encoding ----------
+  function resampleTo16k(buffer){
+    const inRate = buffer.sampleRate;
+    const outRate = 16000;
+    const ch0 = buffer.getChannelData(0);
+    let mono = ch0;
+    if (buffer.numberOfChannels > 1){
+      const ch1 = buffer.getChannelData(1);
+      mono = new Float32Array(ch0.length);
+      for (let i=0;i<ch0.length;i++) mono[i] = (ch0[i]+ch1[i])/2;
+    }
+    if (inRate === outRate) return mono;
+    const ratio = inRate / outRate;
+    const outLen = Math.round(mono.length / ratio);
+    const out = new Float32Array(outLen);
+    for (let i=0;i<outLen;i++){
+      const srcPos = i * ratio;
+      const i0 = Math.floor(srcPos);
+      const i1 = Math.min(i0+1, mono.length-1);
+      const frac = srcPos - i0;
+      out[i] = mono[i0] * (1-frac) + mono[i1] * frac;
+    }
+    return out;
+  }
+
+  function encodeWav(float32, sampleRate){
+    const buffer = new ArrayBuffer(44 + float32.length * 2);
+    const view = new DataView(buffer);
+    const writeStr = (o,s) => { for(let i=0;i<s.length;i++) view.setUint8(o+i, s.charCodeAt(i)); };
+    writeStr(0,'RIFF');
+    view.setUint32(4, 36 + float32.length*2, true);
+    writeStr(8,'WAVE');
+    writeStr(12,'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate*2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeStr(36,'data');
+    view.setUint32(40, float32.length*2, true);
+    let off = 44;
+    for (let i=0;i<float32.length;i++){
+      let s = Math.max(-1, Math.min(1, float32[i]));
+      view.setInt16(off, s < 0 ? s*0x8000 : s*0x7FFF, true);
+      off += 2;
+    }
+    return new Blob([view], {type:'audio/wav'});
+  }
+
+  async function sendChunk(wavBlob){
+    litJack();
+
+    const dePending = addLine(deTranscript, deEmpty, '…transcribing', 'de-text pending');
+    const enPending = addLine(enTranscript, enEmpty, '…translating', 'en-text pending');
+    dePending.classList.add('pending');
+    enPending.classList.add('pending');
+
+    const runRequest = async (translate) => {
+      const fd = new FormData();
+      fd.append('file', wavBlob, 'chunk.wav');
+      fd.append('language', 'de');
+      fd.append('translate', translate ? 'true' : 'false');
+      fd.append('response_format', 'text');
+      const res = await fetch('/inference', {method:'POST', body:fd});
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const txt = (await res.text()).trim();
+      return txt;
+    };
+
+    try{
+      const [deText, enText] = await Promise.all([runRequest(false), runRequest(true)]);
+      setDot(dotServer, 'green');
+      dePending.classList.remove('pending');
+      enPending.classList.remove('pending');
+      dePending.querySelector('.txt').textContent = deText || '·';
+      enPending.querySelector('.txt').textContent = enText || '·';
+      footerLeft.textContent = 'last chunk ok · ' + fmtTime();
+    }catch(e){
+      setDot(dotServer, 'red');
+      dePending.querySelector('.txt').textContent = '[send failed]';
+      enPending.querySelector('.txt').textContent = '[send failed]';
+      footerLeft.textContent = 'error: ' + e.message;
+    }
+  }
+
+  function startLevelMeter(){
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    const draw = () => {
+      analyser.getByteFrequencyData(data);
+      let sum = 0;
+      for (let i=0;i<data.length;i++) sum += data[i];
+      const avg = sum / data.length; // 0..255
+      const activeCount = Math.round((avg/255) * BAR_COUNT * 1.6);
+      bars.forEach((b,i) => {
+        const on = i < activeCount;
+        const h = 15 + Math.min(85, (Math.sin((i/BAR_COUNT)*Math.PI) * (avg/255) * 100));
+        b.style.height = (on ? h : 15) + '%';
+        b.style.background = on ? (avg > 130 ? 'var(--red)' : 'var(--green)') : 'var(--hairline)';
+      });
+      levelRaf = requestAnimationFrame(draw);
+    };
+    draw();
+  }
+
+  async function start(){
+    const ok = await checkServer();
+    if (!ok && !confirm('Server not reachable right now. Start recording anyway?')) return;
+
+    try{
+      mediaStream = await navigator.mediaDevices.getUserMedia({audio:{channelCount:1, echoCancellation:false, noiseSuppression:false, autoGainControl:false}});
+    }catch(e){
+      alert('Could not access microphone: ' + e.message);
+      return;
+    }
+    setDot(dotMic, 'green');
+    setDot(dotLive, 'amber');
+    running = true;
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    footerLeft.textContent = 'recording…';
+
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 256;
+    sourceNode.connect(analyser);
+    startLevelMeter();
+
+    const chunkSeconds = parseInt(chunkLenEl.value, 10);
+    const recordOneChunk = () => {
+      if (!running) return;
+      const dest = audioCtx.createMediaStreamDestination();
+      sourceNode.connect(dest);
+      const recorder = new MediaRecorder(dest.stream);
+      const localChunks = [];
+      recorder.ondataavailable = e => { if (e.data.size > 0) localChunks.push(e.data); };
+      recorder.onstop = async () => {
+        sourceNode.disconnect(dest);
+        const blob = new Blob(localChunks, {type: recorder.mimeType});
+        try{
+          const arrBuf = await blob.arrayBuffer();
+          const decodeCtx = new (window.AudioContext || window.webkitAudioContext)();
+          const audioBuf = await decodeCtx.decodeAudioData(arrBuf);
+          const mono16k = resampleTo16k(audioBuf);
+          const wav = encodeWav(mono16k, 16000);
+          decodeCtx.close();
+          sendChunk(wav);
+        }catch(err){
+          footerLeft.textContent = 'decode error: ' + err.message;
+        }
+        if (running) recordOneChunk();
+      };
+      recorder.start();
+      setTimeout(() => { if (recorder.state !== 'inactive') recorder.stop(); }, chunkSeconds * 1000);
+    };
+    recordOneChunk();
+  }
+
+  function stop(){
+    running = false;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    setDot(dotLive, null);
+    setDot(dotMic, null);
+    footerLeft.textContent = 'stopped';
+    if (levelRaf) cancelAnimationFrame(levelRaf);
+    bars.forEach(b => { b.style.height='15%'; b.style.background='var(--hairline)'; });
+    if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+    if (audioCtx) audioCtx.close();
+  }
+
+  startBtn.addEventListener('click', start);
+  stopBtn.addEventListener('click', stop);
+  clearBtn.addEventListener('click', () => {
+    deTranscript.querySelectorAll('.line').forEach(l => l.remove());
+    enTranscript.querySelectorAll('.line').forEach(l => l.remove());
+    deEmpty.style.display = 'block';
+    enEmpty.style.display = 'block';
+  });
+})();
+</script>
+</body>
+</html>
