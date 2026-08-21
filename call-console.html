@@ -284,21 +284,22 @@
   <div class="field">
     <label for="sourceLang">Source language</label>
     <select id="sourceLang" style="min-width:170px;">
-      <option value="de" selected>German</option>
+      <option value="ar">Arabic</option>
+      <option value="zh">Chinese</option>
+      <option value="nl">Dutch</option>
       <option value="en">English</option>
       <option value="fr">French</option>
-      <option value="es">Spanish</option>
-      <option value="it">Italian</option>
-      <option value="pt">Portuguese</option>
-      <option value="nl">Dutch</option>
-      <option value="pl">Polish</option>
-      <option value="tr">Turkish</option>
-      <option value="ru">Russian</option>
-      <option value="ar">Arabic</option>
+      <option value="de" selected>German</option>
       <option value="hi">Hindi</option>
+      <option value="it">Italian</option>
       <option value="ja">Japanese</option>
       <option value="ko">Korean</option>
-      <option value="zh">Chinese</option>
+      <option value="pl">Polish</option>
+      <option value="pt">Portuguese</option>
+      <option value="ru">Russian</option>
+      <option value="es">Spanish</option>
+      <option value="tr">Turkish</option>
+      <option value="ur">Urdu</option>
     </select>
   </div>
   <div class="field">
@@ -428,8 +429,24 @@
     /(like|abonnier).{0,20}(kanal|glocke)/i,
     /bis zum n(ä|a)chsten mal/i,
   ];
+  // Whisper repetition-loop failure: the decoder gets stuck re-emitting the same token
+  // ("sehr, sehr, sehr, ..." dozens of times) instead of finishing the sentence. Distinct
+  // from the boilerplate-phrase hallucinations above — this is a decode failure, not
+  // training-data leakage — and worth catching independently since a long run of the same
+  // word is never a real utterance. 6+ consecutive repeats of the same word is the bar;
+  // real speech doesn't do that even with genuine stutters/emphasis.
+  function looksRepetitive(text){
+    const words = text.toLowerCase().replace(/[.,!?;:]/g, '').trim().split(/\s+/).filter(Boolean);
+    let run = 1;
+    for (let i = 1; i < words.length; i++){
+      run = words[i] === words[i-1] ? run + 1 : 1;
+      if (run >= 6) return true;
+    }
+    return false;
+  }
+
   function looksHallucinated(text){
-    return HALLUCINATION_PATTERNS.some(re => re.test(text));
+    return HALLUCINATION_PATTERNS.some(re => re.test(text)) || looksRepetitive(text);
   }
 
   function fmtTime(){
@@ -644,12 +661,15 @@
   class HallucinationSkip extends Error {}
 
   // whisper.cpp re-decodes a segment at escalating temperatures whenever its
-  // compression-ratio / avg-logprob checks fail — which is often on noisy 8 kHz HFP audio,
-  // and can multiply decode time on exactly the chunks that are already slowest.
-  // temperature_inc=0 disables that fallback loop: one greedy pass, bounded latency.
+  // compression-ratio / avg-logprob checks fail — which is also whisper's own mechanism
+  // for recovering from repetition-loop decode failures (decoder stuck re-emitting one
+  // token). temperature_inc=0 (tried first, for latency) disables that recovery entirely,
+  // and cost us a real repetition-loop hallucination in practice (2026-08-21 — see
+  // looksRepetitive()). 0.2 restores the retry but keeps it cheap: it only fires on
+  // chunks that actually fail the checks, not on every chunk.
   function applyDecodeParams(fd){
     fd.append('temperature', '0');
-    fd.append('temperature_inc', '0');
+    fd.append('temperature_inc', '0.2');
   }
 
   async function sendChunk(wavBlob, audioMs){

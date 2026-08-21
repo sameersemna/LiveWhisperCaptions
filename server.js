@@ -142,9 +142,10 @@ async function callGoogleTranslate(sourceText, sourceLangCode) {
 }
 
 const LANGUAGE_NAMES = {
-  de:'German', en:'English', fr:'French', es:'Spanish', it:'Italian',
-  pt:'Portuguese', nl:'Dutch', pl:'Polish', tr:'Turkish', ru:'Russian',
-  ar:'Arabic', hi:'Hindi', ja:'Japanese', ko:'Korean', zh:'Chinese'
+  ar:'Arabic', zh:'Chinese', nl:'Dutch', en:'English', fr:'French',
+  de:'German', hi:'Hindi', it:'Italian', ja:'Japanese', ko:'Korean',
+  pl:'Polish', pt:'Portuguese', ru:'Russian', es:'Spanish', tr:'Turkish',
+  ur:'Urdu'
 };
 
 const server = http.createServer(async (req, res) => {
