@@ -63,6 +63,8 @@ const TRANSLATE_MODE = cfg.TRANSLATE_MODE || (OLLAMA_MODEL ? 'llm' : 'whisper');
 
 const HTML_FILE = path.join(__dirname, 'call-console.html');
 const FAVICON_FILE = path.join(__dirname, 'favicon.ico');
+const CERT_FILE = path.join(__dirname, 'cert.pem');
+const KEY_FILE = path.join(__dirname, 'key.pem');
 
 function log(label, ms) {
   console.log(`[${new Date().toISOString().slice(11, 19)}] ${label} — ${ms}ms`);
@@ -148,7 +150,7 @@ const LANGUAGE_NAMES = {
   ur:'Urdu'
 };
 
-const server = http.createServer(async (req, res) => {
+async function requestHandler(req, res) {
   const url = req.url.split('?')[0];
 
   if (req.method === 'GET' && (url === '/' || url === '/index.html')) {
@@ -241,10 +243,36 @@ const server = http.createServer(async (req, res) => {
 
   res.writeHead(404, { 'Content-Type': 'text/plain' });
   res.end('not found');
-});
+}
+
+// getUserMedia (mic access) only works in a "secure context" — https, or the
+// literal hostname "localhost". Plain http:// from another LAN machine (e.g.
+// http://zidan:3000) silently disables navigator.mediaDevices entirely, which
+// is why the mic dropdown/capture breaks for anyone but the host machine.
+// If cert.pem/key.pem exist (see README/CLAUDE.md for the openssl one-liner
+// that generates them), serve https instead so other LAN devices can use the
+// mic too — browsers will show a one-time self-signed-cert warning to accept.
+let server;
+let protocol = 'http';
+let httpsOpts = null;
+try {
+  httpsOpts = { cert: fs.readFileSync(CERT_FILE), key: fs.readFileSync(KEY_FILE) };
+} catch (e) {
+  httpsOpts = null;
+}
+if (httpsOpts) {
+  server = https.createServer(httpsOpts, requestHandler);
+  protocol = 'https';
+} else {
+  server = http.createServer(requestHandler);
+}
 
 server.listen(PORT, () => {
-  console.log(`Vermittlung console:  http://localhost:${PORT}`);
+  console.log(`Vermittlung console:  ${protocol}://localhost:${PORT}`);
+  if (protocol === 'http') {
+    console.log(`  (no cert.pem/key.pem found — mic access will only work from localhost,`);
+    console.log(`   not other LAN machines. See CLAUDE.md for how to generate a self-signed cert.)`);
+  }
   console.log(`Whisper backend:      ${WHISPER_URL}`);
   const modeDesc = TRANSLATE_MODE === 'google' ? 'Google Translate (unofficial endpoint)'
     : TRANSLATE_MODE === 'llm' ? `Ollama (${OLLAMA_URL}, model=${OLLAMA_MODEL})`
