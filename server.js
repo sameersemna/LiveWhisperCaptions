@@ -51,7 +51,6 @@ const cfg = { ...fileEnv, ...process.env };
 const PORT = parseInt(cfg.PORT || '3000', 10);
 const WHISPER_HOST = cfg.WHISPER_HOST || '192.168.178.55:8768';
 const WHISPER_URL = cfg.WHISPER_URL || (/^https?:\/\//.test(WHISPER_HOST) ? WHISPER_HOST : `http://${WHISPER_HOST}`);
-const BT_ADDRESS = cfg.BT_ADDRESS || '';
 const BT_SOURCE = cfg.BT_SOURCE || '';
 
 const whisperHostname = WHISPER_HOST.replace(/^https?:\/\//, '').split(':')[0];
@@ -181,7 +180,6 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       whisperUrl: WHISPER_URL,
-      btAddress: BT_ADDRESS,
       btSource: BT_SOURCE,
       translateMode: TRANSLATE_MODE,
       ollamaModel: OLLAMA_MODEL,

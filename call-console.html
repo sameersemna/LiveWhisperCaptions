@@ -345,6 +345,7 @@
 
 <footer>
   <span id="footerLeft">idle</span>
+  <span id="latencyStats"></span>
   <span id="footerRight">whisper.cpp · large-v3</span>
 </footer>
 
@@ -357,6 +358,7 @@
   const deTranscript = $('deTranscript'), enTranscript = $('enTranscript');
   const deEmpty = $('deEmpty'), enEmpty = $('enEmpty');
   const footerLeft = $('footerLeft'), footerRight = $('footerRight'), serverCheck = $('serverCheck');
+  const latencyStatsEl = $('latencyStats');
   const meterEl = $('meter'), jackStrip = $('jackStrip');
   const btHint = $('btHint');
   const micSelect = $('micSelect');
@@ -475,7 +477,11 @@
         : translateMode === 'llm' ? `large-v3 · ollama translate (${cfg.ollamaModel})`
         : 'large-v3 · dual whisper pass';
       if (cfg.btSource){
-        btHint.textContent = `expects default input: ${cfg.btSource}`;
+        // Not a claim about what's actually selected — the explicit Mic input dropdown
+        // below is the source of truth for that. This is a reference so you can tell
+        // apart look-alike entries (a stale A2DP sink, a "Monitor of ..." loopback, a
+        // second paired phone) and confirm you picked the real HFP source.
+        btHint.textContent = `HFP source to pick below: ${cfg.btSource}`;
       }
     }catch(e){
       serverUrlEl.value = '(could not load config)';
@@ -614,7 +620,25 @@
       numberOfChannels: 1,
       getChannelData: () => merged,
     });
-    sendChunk(encodeWav(mono16k, 16000));
+    const audioMs = Math.round((total / audioCtx.sampleRate) * 1000);
+    sendChunk(encodeWav(mono16k, 16000), audioMs);
+  }
+
+  // Rolling window of recent chunk timings, purely for eyeballing real-call latency —
+  // not persisted anywhere, cleared on reload. audioMs is how long the VAD-cut segment
+  // was; totalMs is speech-cut-to-both-panes-filled, i.e. the number that actually
+  // matters for perceived latency (it does NOT include the HANGOVER_MS=600 the VAD
+  // already waited before cutting — that's a fixed, separate cost, not per-chunk noise).
+  const LATENCY_HISTORY_MAX = 10;
+  const latencyHistory = [];
+  function recordLatency(audioMs, totalMs){
+    latencyHistory.push({audioMs, totalMs});
+    if (latencyHistory.length > LATENCY_HISTORY_MAX) latencyHistory.shift();
+    const avg = arr => Math.round(arr.reduce((a,b)=>a+b,0) / arr.length);
+    const avgAudio = avg(latencyHistory.map(h => h.audioMs));
+    const avgTotal = avg(latencyHistory.map(h => h.totalMs));
+    latencyStatsEl.textContent =
+      `last ${totalMs}ms · avg ${avgTotal}ms (n=${latencyHistory.length}) · avg segment ${(avgAudio/1000).toFixed(1)}s`;
   }
 
   class HallucinationSkip extends Error {}
@@ -628,10 +652,10 @@
     fd.append('temperature_inc', '0');
   }
 
-  async function sendChunk(wavBlob){
+  async function sendChunk(wavBlob, audioMs){
     litJack();
 
-    const dePending = addLine(deTranscript, deEmpty, '…transcribing', 'de-text pending');
+    const dePending = addLine(deTranscript, deEmpty, `…transcribing (${(audioMs/1000).toFixed(1)}s audio)`, 'de-text pending');
     const enPending = addLine(enTranscript, enEmpty, '…translating', 'en-text pending');
     dePending.classList.add('pending');
     enPending.classList.add('pending');
@@ -724,7 +748,9 @@
     try{
       await Promise.all([transcribeTask, translateTask]);
       setDot(dotServer, 'green');
-      footerLeft.textContent = `last chunk ok · total ${Math.round(performance.now() - t0)}ms · ${fmtTime()}`;
+      const totalMs = Math.round(performance.now() - t0);
+      footerLeft.textContent = `last chunk ok · total ${totalMs}ms · ${fmtTime()}`;
+      recordLatency(audioMs, totalMs);
     }catch(e){
       if (e instanceof HallucinationSkip){
         setDot(dotServer, 'green');
