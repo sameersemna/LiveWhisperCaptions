@@ -1,0 +1,21 @@
+# Known Whisper hallucination phrases — stock subtitle/broadcaster boilerplate
+# that shows up on silence or near-silence, not real transcription.
+#
+# One phrase per line, matched as a case-insensitive substring (not a regex).
+# Blank lines and lines starting with # are ignored. Served by server.js at
+# GET /hallucinations for anything that wants to filter on this list —
+# currently call-transcribe-live.sh. (call-console.html's browser-side
+# filter is a separate, regex-based list — HALLUCINATION_PATTERNS in the
+# HTML — not yet unified with this file; see CLAUDE.md.)
+vielen dank
+vielen dank.
+subtitles by
+amara.org
+danke
+danke schön
+ende
+the end
+thank you
+thanks
+subtitle
+community

@@ -73,12 +73,15 @@
   .status-cluster{
     display:flex;
     align-items:center;
-    gap:18px;
+    gap:14px;
+    flex-wrap:wrap;
     font-family:var(--mono);
     font-size:11px;
     color:var(--text-muted);
   }
   .status{display:flex;align-items:center;gap:7px;}
+  .header-divider{width:1px; height:18px; background:var(--hairline); flex-shrink:0;}
+  .header-actions{display:flex; align-items:center; gap:8px;}
   .dot{
     width:7px;height:7px;border-radius:50%;
     background:var(--text-faint);
@@ -109,15 +112,6 @@
   }
 
   /* ---------- Controls ---------- */
-  .controls{
-    display:flex;
-    align-items:flex-end;
-    gap:20px;
-    flex-wrap:wrap;
-    padding:18px 28px;
-    background:var(--panel);
-    border-bottom:1px solid var(--hairline);
-  }
   .field{display:flex; flex-direction:column; gap:6px;}
   .field label{
     font-family:var(--mono);
@@ -126,6 +120,42 @@
     text-transform:uppercase;
     color:var(--text-faint);
   }
+
+  /* ---------- Settings modal ---------- */
+  .modal-overlay{
+    position:fixed; inset:0;
+    background:rgba(4,6,10,.72);
+    display:flex; align-items:center; justify-content:center;
+    padding:24px;
+    opacity:0; pointer-events:none;
+    transition:opacity .15s ease;
+    z-index:100;
+  }
+  .modal-overlay.open{opacity:1; pointer-events:auto;}
+  .modal{
+    background:var(--panel);
+    border:1px solid var(--hairline);
+    border-radius:8px;
+    width:100%; max-width:440px;
+    max-height:calc(100vh - 48px);
+    overflow-y:auto;
+    box-shadow:0 24px 60px rgba(0,0,0,.5);
+    transform:translateY(8px) scale(.98);
+    transition:transform .15s ease;
+  }
+  .modal-overlay.open .modal{transform:translateY(0) scale(1);}
+  .modal-head{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:18px 22px;
+    border-bottom:1px solid var(--hairline);
+  }
+  .modal-head h2{
+    font-family:var(--mono); font-size:13px; letter-spacing:.14em;
+    text-transform:uppercase; font-weight:700; color:var(--text); margin:0;
+  }
+  .modal-body{display:flex; flex-direction:column; gap:18px; padding:22px;}
+  .modal-body .field{gap:8px;}
+  .modal-body input[type=text], .modal-body select{min-width:0; width:100%;}
   input[type=text], select{
     background:var(--panel-raised);
     border:1px solid var(--hairline);
@@ -161,6 +191,58 @@
     background:transparent; border-color:var(--hairline); color:var(--text-muted);
   }
   .btn-ghost:hover{border-color:var(--text-muted); color:var(--text);}
+  .icon-btn{
+    display:inline-flex; align-items:center; justify-content:center;
+    width:26px; height:26px; padding:0;
+  }
+  .icon-btn svg{width:14px; height:14px; display:block;}
+  .pane-head-right{display:flex; align-items:center; gap:10px;}
+
+  /* Generic tooltip: add data-tooltip="..." to any element. Deliberately not the
+     native title="" attribute — that tooltip is slow to appear, unstyleable, and
+     would double up with this one if both were present on the same element.
+     Points downward, not the more usual upward — these buttons sit in the
+     pane-head strip right at the top of <main>, which clips overflow (grid gutter
+     background trick), so an upward tooltip would be cut off before it could show. */
+  [data-tooltip]{position:relative;}
+  [data-tooltip]::after,
+  [data-tooltip]::before{
+    position:absolute;
+    left:50%;
+    opacity:0;
+    pointer-events:none;
+    transition:opacity .12s ease, transform .12s ease;
+    transform:translate(-50%, -2px);
+    z-index:30;
+  }
+  [data-tooltip]::after{
+    content:attr(data-tooltip);
+    top:calc(100% + 11px);
+    background:var(--panel);
+    color:var(--text);
+    border:1px solid var(--hairline);
+    padding:7px 11px;
+    border-radius:5px;
+    font-family:var(--mono);
+    font-size:10.5px;
+    font-weight:400;
+    letter-spacing:.03em;
+    text-transform:none;
+    white-space:nowrap;
+    box-shadow:0 8px 20px rgba(0,0,0,.4);
+  }
+  [data-tooltip]::before{
+    content:'';
+    top:calc(100% + 6px);
+    border:5px solid transparent;
+    border-bottom-color:var(--panel);
+    filter:drop-shadow(0 2px 1px rgba(0,0,0,.25));
+  }
+  [data-tooltip]:hover::after, [data-tooltip]:hover::before,
+  [data-tooltip]:focus-visible::after, [data-tooltip]:focus-visible::before{
+    opacity:1;
+    transform:translate(-50%, 0);
+  }
 
   .meter{
     display:flex; align-items:flex-end; gap:2px; height:22px; margin-left:4px;
@@ -251,7 +333,6 @@
 
   @media (max-width: 760px){
     main{grid-template-columns:1fr;}
-    .controls{gap:14px;}
     input[type=text]{min-width:160px;}
   }
 </style>
@@ -271,73 +352,121 @@
       <div class="status"><span class="dot" id="dotLive"></span>LIVE</div>
       <div class="meter" id="meter"></div>
       <span id="energyReadout" style="font-family:var(--mono); font-size:10px; color:var(--text-faint); min-width:52px;">lvl: —</span>
+
+      <span class="header-divider"></span>
+
+      <span class="header-actions">
+        <button class="btn btn-start icon-btn" id="startBtn" type="button" aria-label="Start call" data-tooltip="Start call">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+        </button>
+        <button class="btn btn-stop icon-btn" id="stopBtn" type="button" disabled aria-label="Stop call" data-tooltip="Stop call">
+          <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+        </button>
+        <button class="btn btn-ghost icon-btn" id="clearBtn" type="button" aria-label="Clear transcript" data-tooltip="Clear transcript">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 7h16"/>
+            <path d="M9 7V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v3"/>
+            <path d="M6 7l1 14a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-14"/>
+            <path d="M10 11v6M14 11v6"/>
+          </svg>
+        </button>
+        <button class="btn btn-ghost icon-btn" id="settingsBtn" type="button" aria-label="Open settings" data-tooltip="Settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M 21.06 10.42 L 21.06 13.58 L 19.49 13.31 L 18.22 16.37 L 19.53 17.29 L 17.29 19.53 L 16.37 18.22 L 13.31 19.49 L 13.58 21.06 L 10.42 21.06 L 10.69 19.49 L 7.63 18.22 L 6.71 19.53 L 4.47 17.29 L 5.78 16.37 L 4.51 13.31 L 2.94 13.58 L 2.94 10.42 L 4.51 10.69 L 5.78 7.63 L 4.47 6.71 L 6.71 4.47 L 7.63 5.78 L 10.69 4.51 L 10.42 2.94 L 13.58 2.94 L 13.31 4.51 L 16.37 5.78 L 17.29 4.47 L 19.53 6.71 L 18.22 7.63 L 19.49 10.69 Z"/>
+            <circle cx="12" cy="12" r="3"/>
+          </svg>
+        </button>
+      </span>
+
+      <span class="header-divider"></span>
+
+      <span id="serverCheck" style="font-family:var(--mono); font-size:11px; color:var(--text-faint);">not checked</span>
     </div>
   </div>
   <div class="jack-strip" id="jackStrip"></div>
 </header>
 
-<div class="controls">
-  <div class="field">
-    <label>Whisper server (proxied)</label>
-    <input type="text" id="serverUrl" value="loading…" spellcheck="false" readonly style="color:var(--text-muted); cursor:default;">
-  </div>
-  <div class="field">
-    <label for="sourceLang">Source language</label>
-    <select id="sourceLang" style="min-width:170px;">
-      <option value="ar">Arabic</option>
-      <option value="zh">Chinese</option>
-      <option value="nl">Dutch</option>
-      <option value="en">English</option>
-      <option value="fr">French</option>
-      <option value="de" selected>German</option>
-      <option value="hi">Hindi</option>
-      <option value="it">Italian</option>
-      <option value="ja">Japanese</option>
-      <option value="ko">Korean</option>
-      <option value="pl">Polish</option>
-      <option value="pt">Portuguese</option>
-      <option value="ru">Russian</option>
-      <option value="es">Spanish</option>
-      <option value="tr">Turkish</option>
-      <option value="ur">Urdu</option>
-    </select>
-  </div>
-  <div class="field">
-    <label for="chunkLen">Max segment length</label>
-    <select id="chunkLen">
-      <option value="6">6s</option>
-      <option value="8">8s</option>
-      <option value="12" selected>12s</option>
-      <option value="20">20s</option>
-    </select>
-  </div>
-  <div class="field">
-    <label for="micSelect">Mic input</label>
-    <div style="display:flex; gap:6px;">
-      <select id="micSelect" style="min-width:260px;">
-        <option value="">detecting devices…</option>
-      </select>
-      <button class="btn btn-ghost" id="refreshMicBtn" type="button" title="Re-scan input devices" style="padding:8px 12px;">↻</button>
+<div class="modal-overlay" id="settingsOverlay" inert>
+  <div class="modal" id="settingsModal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+    <div class="modal-head">
+      <h2 id="settingsTitle">Settings</h2>
+      <button class="btn btn-ghost icon-btn" id="settingsCloseBtn" type="button" aria-label="Close settings" data-tooltip="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18"/><path d="M6 6l12 12"/></svg>
+      </button>
     </div>
-  </div>
-  <button class="btn btn-start" id="startBtn">Start call</button>
-  <button class="btn btn-stop" id="stopBtn" disabled>Stop</button>
-  <button class="btn btn-ghost" id="clearBtn">Clear transcript</button>
-  <div class="field" style="margin-left:auto;">
-    <label>&nbsp;</label>
-    <span id="serverCheck" style="font-family:var(--mono); font-size:11px; color:var(--text-faint);">not checked</span>
+    <div class="modal-body">
+      <div class="field">
+        <label>Whisper server (proxied)</label>
+        <input type="text" id="serverUrl" value="loading…" spellcheck="false" readonly style="color:var(--text-muted); cursor:default;">
+      </div>
+      <div class="field">
+        <label for="sourceLang">Source language</label>
+        <select id="sourceLang">
+          <option value="ar">Arabic</option>
+          <option value="zh">Chinese</option>
+          <option value="nl">Dutch</option>
+          <option value="en">English</option>
+          <option value="fr">French</option>
+          <option value="de" selected>German</option>
+          <option value="hi">Hindi</option>
+          <option value="it">Italian</option>
+          <option value="ja">Japanese</option>
+          <option value="ko">Korean</option>
+          <option value="pl">Polish</option>
+          <option value="pt">Portuguese</option>
+          <option value="ru">Russian</option>
+          <option value="es">Spanish</option>
+          <option value="tr">Turkish</option>
+          <option value="ur">Urdu</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="chunkLen">Max segment length</label>
+        <select id="chunkLen">
+          <option value="6">6s</option>
+          <option value="8">8s</option>
+          <option value="12" selected>12s</option>
+          <option value="20">20s</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="micSelect">Mic input</label>
+        <div style="display:flex; gap:6px;">
+          <select id="micSelect" style="min-width:0; flex:1;">
+            <option value="">detecting devices…</option>
+          </select>
+          <button class="btn btn-ghost" id="refreshMicBtn" type="button" title="Re-scan input devices" style="padding:8px 12px;">↻</button>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 
 <main>
   <div class="pane">
-    <div class="pane-head de" id="dePaneHead"><span id="dePaneLabel">Deutsch — original</span><span class="flag" id="dePaneFlag">DE</span></div>
+    <div class="pane-head de" id="dePaneHead">
+      <span id="dePaneLabel">Deutsch — original</span>
+      <span class="pane-head-right">
+        <button class="btn btn-ghost icon-btn" id="exportDeBtn" type="button" aria-label="Download original-language transcript as SRT" data-tooltip="Export SRT — original language">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>
+        </button>
+        <span class="flag" id="dePaneFlag">DE</span>
+      </span>
+    </div>
     <div class="transcript" id="deTranscript">
       <div class="empty-state" id="deEmpty">Press <b>Start call</b> once your Bluetooth<br>source is set as the default input.<br>Source-language text appears here as it's heard.</div>
     </div>
   </div>
   <div class="pane">
-    <div class="pane-head en"><span>English — translation</span><span class="flag">EN</span></div>
+    <div class="pane-head en">
+      <span>English — translation</span>
+      <span class="pane-head-right">
+        <button class="btn btn-ghost icon-btn" id="exportEnBtn" type="button" aria-label="Download English translation as SRT" data-tooltip="Export SRT — English translation">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>
+        </button>
+        <span class="flag">EN</span>
+      </span>
+    </div>
     <div class="transcript" id="enTranscript">
       <div class="empty-state" id="enEmpty">The English translation of each<br>chunk streams in here, a few<br>seconds behind the German.</div>
     </div>
@@ -353,6 +482,22 @@
 <script>
 (() => {
   const $ = id => document.getElementById(id);
+
+  // ---------- Persisted control settings ----------
+  // Wrapped in try/catch: localStorage throws in some private-browsing modes rather than
+  // just being unavailable, and losing the remembered dropdown value isn't worth a crash.
+  const STORE_PREFIX = 'vermittlung:';
+  const loadStored = (key) => { try { return localStorage.getItem(STORE_PREFIX + key); } catch (e) { return null; } };
+  const saveStored = (key, val) => { try { localStorage.setItem(STORE_PREFIX + key, val); } catch (e) { /* unavailable — non-fatal */ } };
+  // Restores a saved value (if it's still a valid option) and wires the select to persist
+  // future changes. Static-option selects only — micSelect is populated dynamically and
+  // handled separately in populateMicDevices().
+  function persistSelect(el, key){
+    const saved = loadStored(key);
+    if (saved !== null && [...el.options].some(o => o.value === saved)) el.value = saved;
+    el.addEventListener('change', () => saveStored(key, el.value));
+  }
+
   const serverUrlEl = $('serverUrl'), chunkLenEl = $('chunkLen');
   const startBtn = $('startBtn'), stopBtn = $('stopBtn'), clearBtn = $('clearBtn');
   const dotMic = $('dotMic'), dotServer = $('dotServer'), dotLive = $('dotLive');
@@ -365,11 +510,13 @@
   const micSelect = $('micSelect');
   const sourceLangEl = $('sourceLang');
   const dePaneLabel = $('dePaneLabel'), dePaneFlag = $('dePaneFlag');
+  persistSelect(sourceLangEl, 'sourceLang');
+  persistSelect(chunkLenEl, 'chunkLen');
 
   const LANGUAGE_NAMES = {
     de:'Deutsch', en:'English', fr:'Français', es:'Español', it:'Italiano',
     pt:'Português', nl:'Nederlands', pl:'Polski', tr:'Türkçe', ru:'Русский',
-    ar:'العربية', hi:'हिन्दी', ja:'日本語', ko:'한국어', zh:'中文'
+    ar:'العربية', hi:'हिन्दी', ja:'日本語', ko:'한국어', zh:'中文', ur:'اردو'
   };
   function updatePaneLabels(){
     const code = sourceLangEl.value;
@@ -399,6 +546,12 @@
   let running = false;
   let levelRaf = null;
   let liveEnergy = 0;
+  let callStartMs = 0; // performance.now() at call start — SRT cue times are relative to this
+
+  // Cues actually rendered on screen, in call-relative ms — exported as SRT on demand.
+  // Filtered/failed lines never reach these (see the success-path pushes in sendChunk).
+  let deCues = [];
+  let enCues = [];
 
   const SILENCE_THRESHOLD = 6; // avg byte-frequency level (0-255); tune using the live "lvl:" readout in the header
 
@@ -452,6 +605,40 @@
   function fmtTime(){
     const d = new Date();
     return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  }
+
+  // ---------- SRT export ----------
+  function srtTimestamp(ms){
+    ms = Math.max(0, Math.round(ms));
+    const h = Math.floor(ms / 3600000);
+    const m = Math.floor((ms % 3600000) / 60000);
+    const s = Math.floor((ms % 60000) / 1000);
+    const msRem = ms % 1000;
+    const pad = (n, len) => String(n).padStart(len, '0');
+    return `${pad(h,2)}:${pad(m,2)}:${pad(s,2)},${pad(msRem,3)}`;
+  }
+
+  function cuesToSrt(cues){
+    return cues.map((c, i) =>
+      `${i+1}\n${srtTimestamp(c.startMs)} --> ${srtTimestamp(c.endMs)}\n${c.text}\n`
+    ).join('\n');
+  }
+
+  function downloadSrt(cues, filenamePrefix){
+    if (!cues.length){
+      alert('Nothing to export yet — no transcript lines for this call.');
+      return;
+    }
+    const blob = new Blob([cuesToSrt(cues)], {type: 'text/plain;charset=utf-8'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    a.href = url;
+    a.download = `${filenamePrefix}-${stamp}.srt`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
   }
 
   function addLine(pane, emptyEl, text, cls){
@@ -557,10 +744,17 @@
       if (btGroup.children.length) micSelect.appendChild(btGroup);
       if (localGroup.children.length) micSelect.appendChild(localGroup);
       if (bestId !== null) micSelect.value = bestId;
+
+      // Prefer a remembered device over the auto-detect heuristic above, but only if
+      // it's still actually plugged in — deviceIds are stable per-origin across
+      // reloads in practice, but not guaranteed across devices being unplugged.
+      const savedMic = loadStored('micId');
+      if (savedMic !== null && inputs.some(d => d.deviceId === savedMic)) micSelect.value = savedMic;
     }catch(e){
       micSelect.innerHTML = '<option value="">mic permission needed — click Start call</option>';
     }
   }
+  micSelect.addEventListener('change', () => saveStored('micId', micSelect.value));
   populateMicDevices();
 
   // ---------- WAV encoding ----------
@@ -683,6 +877,12 @@
     const t0 = performance.now();
     const sourceLang = sourceLangEl.value;
 
+    // Shared cue timing for both panes: the chunk boundary (t0, i.e. "now") is the cue's
+    // end, and its start is audioMs earlier — an SRT-cue derivation of the same audio
+    // duration flushSegment() already computed, not a fresh measurement.
+    const cueEndMs = t0 - callStartMs;
+    const cueStartMs = Math.max(0, cueEndMs - audioMs);
+
     const markFiltered = (el) => {
       el.classList.remove('pending');
       el.querySelector('.txt').textContent = '· filtered (likely hallucination) ·';
@@ -708,6 +908,7 @@
       }
       dePending.classList.remove('pending');
       dePending.querySelector('.txt').textContent = text || '·';
+      if (text) deCues.push({startMs: cueStartMs, endMs: cueEndMs, text});
       return text;
     })().catch(err => {
       if (!(err instanceof HallucinationSkip)){
@@ -736,6 +937,7 @@
         enPending.classList.remove('pending');
         enPending.querySelector('.txt').textContent = text || '·';
         enPending.querySelector('.ts').textContent += `  ·  ${ms}ms`;
+        if (text) enCues.push({startMs: cueStartMs, endMs: cueEndMs, text});
       } else {
         const fd = new FormData();
         fd.append('file', wavBlob, 'chunk.wav');
@@ -754,6 +956,7 @@
         }
         enPending.classList.remove('pending');
         enPending.querySelector('.txt').textContent = text || '·';
+        if (text) enCues.push({startMs: cueStartMs, endMs: cueEndMs, text});
       }
     })().catch(err => {
       if (err instanceof HallucinationSkip){
@@ -858,6 +1061,13 @@
     stopBtn.disabled = false;
     footerLeft.textContent = 'recording…';
 
+    // SRT export covers cues from this Start click onward — a fresh timeline each call,
+    // same as pressing Clear transcript would give you, so cue times stay monotonic
+    // even if a call is stopped and restarted without clearing the visible transcript.
+    callStartMs = performance.now();
+    deCues = [];
+    enCues = [];
+
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     sourceNode = audioCtx.createMediaStreamSource(mediaStream);
     analyser = audioCtx.createAnalyser();
@@ -915,12 +1125,35 @@
     if (audioCtx) audioCtx.close();
   }
 
+  // ---------- Settings modal ----------
+  const settingsOverlay = $('settingsOverlay');
+  const openSettings = () => {
+    settingsOverlay.classList.add('open');
+    settingsOverlay.inert = false;
+    $('settingsCloseBtn').focus();
+  };
+  const closeSettings = () => {
+    settingsOverlay.classList.remove('open');
+    settingsOverlay.inert = true;
+    $('settingsBtn').focus();
+  };
+  $('settingsBtn').addEventListener('click', openSettings);
+  $('settingsCloseBtn').addEventListener('click', closeSettings);
+  settingsOverlay.addEventListener('click', (e) => { if (e.target === settingsOverlay) closeSettings(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && settingsOverlay.classList.contains('open')) closeSettings();
+  });
+
   startBtn.addEventListener('click', start);
   stopBtn.addEventListener('click', stop);
   $('refreshMicBtn').addEventListener('click', populateMicDevices);
+  $('exportDeBtn').addEventListener('click', () => downloadSrt(deCues, 'transcript-original'));
+  $('exportEnBtn').addEventListener('click', () => downloadSrt(enCues, 'transcript-english'));
   clearBtn.addEventListener('click', () => {
     deTranscript.querySelectorAll('.line').forEach(l => l.remove());
     enTranscript.querySelectorAll('.line').forEach(l => l.remove());
+    deCues = [];
+    enCues = [];
     deEmpty.style.display = 'block';
     enEmpty.style.display = 'block';
   });

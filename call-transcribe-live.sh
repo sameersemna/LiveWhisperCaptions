@@ -31,8 +31,20 @@ SILENCE_DURATION=0.3
 RMS_THRESHOLD_DB=-40
 # Minimum transcription length to avoid hallucinations
 MIN_TEXT_LENGTH=20
-# Common Whisper hallucinations to filter out (case-insensitive)
-HALLUCINATIONS=("vielen dank" "subtitles by" "amara.org" "danke" "danke schön" "ende" "the end" "thank you" "thanks" "subtitle" "community")
+
+# Common Whisper hallucinations to filter out (case-insensitive substrings),
+# read directly from hallucinations.txt — same convention this script
+# already uses for .env: relative to cwd, no network call. Keeps this
+# script fully standalone with no dependency on `node server.js` being up.
+# Note: the browser console (call-console.html) has its own separate,
+# regex-based hallucination list — not this file. See CLAUDE.md.
+HALLUCINATIONS_FILE="hallucinations.txt"
+if [ -f "$HALLUCINATIONS_FILE" ]; then
+  mapfile -t HALLUCINATIONS < <(grep -vE '^\s*(#|$)' "$HALLUCINATIONS_FILE")
+else
+  echo "Warning: $HALLUCINATIONS_FILE not found — hallucination filtering disabled." >&2
+  HALLUCINATIONS=()
+fi
 BASENAME="call_live_$(date +%s)"
 TMPDIR="/tmp/${BASENAME}_chunks"
 mkdir -p "$TMPDIR"
