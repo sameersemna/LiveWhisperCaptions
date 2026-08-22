@@ -545,6 +545,7 @@
   let audioCtx, mediaStream, analyser, sourceNode, procNode, silentGain;
   let running = false;
   let levelRaf = null;
+  let healthPollInterval = null;
   let liveEnergy = 0;
   let callStartMs = 0; // performance.now() at call start — SRT cue times are relative to this
 
@@ -556,17 +557,19 @@
   const SILENCE_THRESHOLD = 6; // avg byte-frequency level (0-255); tune using the live "lvl:" readout in the header
 
   // ---------- VAD endpointer ----------
-  // Capture is one continuous PCM stream for the whole call (via a ScriptProcessorNode,
-  // see start()); this state machine decides where to cut it into chunks to send, using the
+  // Capture is one continuous PCM stream for the whole call (via an AudioWorkletNode, see
+  // start()); this state machine decides where to cut it into chunks to send, using the
   // same avg frequency-domain energy metric as SILENCE_THRESHOLD/the level meter above —
-  // one threshold, one number to tune, both places.
+  // one threshold, one number to tune, both places. The tick itself runs inside the
+  // worklet's port.onmessage handler in start(), not here — dt comes from the exact sample
+  // count of each audio-thread batch (samples.length / sampleRate), not a wall-clock delta,
+  // so it stays correct even if the main thread is busy or the tab is backgrounded.
   const HANGOVER_MS = 600;      // trailing silence required after speech before cutting a chunk
   const MIN_SPEECH_MS = 250;    // ignore blips shorter than this — not worth a round trip
   const IDLE_RESET_MS = 2000;   // drop accumulated pure-silence audio after this long (bounds memory)
   let segFrames = [];           // Float32Array pieces captured since the last cut
   let segHasSpeech = false;
   let segSpeechMs = 0, segSilenceMs = 0, segMs = 0;
-  let vadLastTs = null;
 
   const energyReadout = $('energyReadout');
 
@@ -758,28 +761,28 @@
   populateMicDevices();
 
   // ---------- WAV encoding ----------
-  function resampleTo16k(buffer){
-    const inRate = buffer.sampleRate;
+  // Resamples mono Float32 PCM to 16kHz using OfflineAudioContext rather than a hand-rolled
+  // linear interpolator. Linear interpolation has no anti-aliasing filter — downsampling
+  // straight from 48kHz (typical getUserMedia rate) to 16kHz folds content above the new
+  // 8kHz Nyquist limit back down into the audible band as aliasing distortion, corrupting
+  // exactly the frequency range Whisper depends on. Browsers' native resampler (used here by
+  // rendering through an OfflineAudioContext at the target rate) applies a proper low-pass
+  // filter first, matching what a real resampling library (e.g. ffmpeg's swresample, which
+  // is what call-transcribe-live.sh gets for free) would do. This is async — flushSegment()
+  // awaits it — where the old synchronous version wasn't.
+  async function resampleTo16k(mono, inRate){
     const outRate = 16000;
-    const ch0 = buffer.getChannelData(0);
-    let mono = ch0;
-    if (buffer.numberOfChannels > 1){
-      const ch1 = buffer.getChannelData(1);
-      mono = new Float32Array(ch0.length);
-      for (let i=0;i<ch0.length;i++) mono[i] = (ch0[i]+ch1[i])/2;
-    }
     if (inRate === outRate) return mono;
-    const ratio = inRate / outRate;
-    const outLen = Math.round(mono.length / ratio);
-    const out = new Float32Array(outLen);
-    for (let i=0;i<outLen;i++){
-      const srcPos = i * ratio;
-      const i0 = Math.floor(srcPos);
-      const i1 = Math.min(i0+1, mono.length-1);
-      const frac = srcPos - i0;
-      out[i] = mono[i0] * (1-frac) + mono[i1] * frac;
-    }
-    return out;
+    const outLen = Math.ceil(mono.length * outRate / inRate);
+    const offlineCtx = new OfflineAudioContext(1, outLen, outRate);
+    const buf = offlineCtx.createBuffer(1, mono.length, inRate);
+    buf.copyToChannel(mono, 0);
+    const src = offlineCtx.createBufferSource();
+    src.buffer = buf;
+    src.connect(offlineCtx.destination);
+    src.start(0);
+    const rendered = await offlineCtx.startRendering();
+    return rendered.getChannelData(0);
   }
 
   function encodeWav(float32, sampleRate){
@@ -809,11 +812,11 @@
   }
 
   // Concatenates the raw PCM captured since the last cut, resamples/encodes it, and sends
-  // it — or just drops it if the VAD loop decided this stretch was silence. Builds a
-  // buffer-like object (sampleRate/numberOfChannels/getChannelData) rather than a real
-  // AudioBuffer so resampleTo16k can stay as-is; there's no decodeAudioData step any more
-  // since capture is already raw PCM, not an encoded container.
-  function flushSegment(send){
+  // it — or just drops it if the VAD loop decided this stretch was silence. Capture is
+  // already mono raw PCM (getUserMedia requested channelCount:1), so no downmix needed.
+  // async because resampleTo16k now renders through an OfflineAudioContext (see its
+  // comment) — callers already fire-and-forget this (same as they did with sendChunk).
+  async function flushSegment(send){
     const frames = segFrames;
     segFrames = [];
     segHasSpeech = false;
@@ -826,11 +829,7 @@
     let off = 0;
     for (const f of frames){ merged.set(f, off); off += f.length; }
 
-    const mono16k = resampleTo16k({
-      sampleRate: audioCtx.sampleRate,
-      numberOfChannels: 1,
-      getChannelData: () => merged,
-    });
+    const mono16k = await resampleTo16k(merged, audioCtx.sampleRate);
     const audioMs = Math.round((total / audioCtx.sampleRate) * 1000);
     sendChunk(encodeWav(mono16k, 16000), audioMs);
   }
@@ -985,14 +984,17 @@
     }
   }
 
+  // Purely cosmetic now — the bar graph and "lvl:" readout. The VAD decision that used to
+  // live in this rAF loop has moved to the AudioWorklet message handler in start() (see the
+  // big comment there for why): rAF is throttled to ~1fps or halted outright in a backgrounded
+  // tab, which is exactly when a live-call user is likely to alt-tab away, and cutting VAD
+  // segments off a stalled rAF clock was producing wildly wrong segment boundaries — the
+  // actual cause of the accuracy regression this function used to also be responsible for.
+  // liveEnergy is still read here for display, but it's now written by the worklet handler,
+  // not measured in this loop.
   function startLevelMeter(){
-    const data = new Uint8Array(analyser.frequencyBinCount);
     const draw = () => {
-      analyser.getByteFrequencyData(data);
-      let sum = 0;
-      for (let i=0;i<data.length;i++) sum += data[i];
-      const avg = sum / data.length; // 0..255
-      liveEnergy = avg;
+      const avg = liveEnergy;
       energyReadout.textContent = 'lvl: ' + avg.toFixed(1);
       energyReadout.style.color = avg < SILENCE_THRESHOLD ? 'var(--text-faint)' : 'var(--green)';
       const activeCount = Math.round((avg/255) * BAR_COUNT * 1.6);
@@ -1002,33 +1004,6 @@
         b.style.height = (on ? h : 15) + '%';
         b.style.background = on ? (avg > 130 ? 'var(--red)' : 'var(--green)') : 'var(--hairline)';
       });
-
-      // VAD tick — decide whether the segment accumulating in segFrames (via the
-      // ScriptProcessor in start()) should be cut now. Driven off the same avg energy
-      // reading as the meter/threshold above, using real elapsed time (rAF isn't fixed-rate).
-      const now = performance.now();
-      const dt = vadLastTs === null ? 0 : (now - vadLastTs);
-      vadLastTs = now;
-      if (running){
-        const maxSegmentMs = parseInt(chunkLenEl.value, 10) * 1000;
-        if (avg >= SILENCE_THRESHOLD){
-          segHasSpeech = true;
-          segSpeechMs += dt;
-          segSilenceMs = 0;
-        } else {
-          segSilenceMs += dt;
-        }
-        segMs += dt;
-
-        if (segHasSpeech && segSilenceMs >= HANGOVER_MS && segSpeechMs >= MIN_SPEECH_MS){
-          flushSegment(true);                          // natural end of utterance
-        } else if (segHasSpeech && segMs >= maxSegmentMs){
-          flushSegment(true);                          // safety cap — continuous speech, no pause
-        } else if (!segHasSpeech && segMs >= IDLE_RESET_MS){
-          flushSegment(false);                         // nothing but silence — drop it, bound memory
-        }
-      }
-
       levelRaf = requestAnimationFrame(draw);
     };
     draw();
@@ -1073,38 +1048,130 @@
     analyser = audioCtx.createAnalyser();
     analyser.fftSize = 256;
     sourceNode.connect(analyser);
+    const vadEnergyData = new Uint8Array(analyser.frequencyBinCount);
 
-    // Continuous raw-PCM capture for the whole call — no more per-chunk MediaRecorder
-    // start/stop cycling, so there's no capture gap to paper over and no encode/decode
-    // round trip before we can resample. The VAD loop in startLevelMeter()'s rAF tick
-    // decides when to cut segFrames into a chunk (see flushSegment()); this callback's
-    // only job is to keep appending raw samples to it.
+    // Continuous raw-PCM capture for the whole call, via an AudioWorkletNode running on the
+    // dedicated audio rendering thread — not the main thread, and not gated on rAF.
     //
-    // ScriptProcessorNode is deprecated in favor of AudioWorkletNode, but the worklet
-    // replacement needs its own module file (or a Blob-URL trick to fake one) — more
-    // moving parts for a project that's deliberately a single portable HTML file with no
-    // build step. ScriptProcessorNode still works in every browser this project targets;
-    // revisit only if that stops being true.
-    procNode = audioCtx.createScriptProcessor(4096, 1, 1);
-    procNode.onaudioprocess = (e) => {
+    // This used to be a ScriptProcessorNode with VAD segment-cut decisions driven from
+    // requestAnimationFrame in startLevelMeter(). That combination is the root cause of a
+    // real accuracy regression (2026-08-22): rAF is throttled to ~1fps or halted entirely in
+    // a backgrounded tab — which Chrome only exempts for tabs producing *audible* output, and
+    // this tab deliberately never does (see the silentGain comment below) — so alt-tabbing
+    // away during a call, an extremely normal thing to do on a live call console, would stall
+    // or badly skew the VAD's wall-clock timing. ScriptProcessorNode itself also runs on the
+    // main thread and is documented to glitch under main-thread load. call-transcribe-live.sh
+    // has none of this: it's a standalone process with its own wall-clock timer, immune to
+    // any browser tab-visibility policy — which is exactly why it stayed accurate while this
+    // page didn't. AudioWorkletNode's process() callback runs on the audio thread regardless
+    // of tab visibility or main-thread business, so both capture and VAD timing are now
+    // immune to the same failure mode. The module is defined inline and loaded via a Blob URL
+    // (no separate file) to keep this project's single-file/no-build-step shape intact.
+    const workletSrc = `
+      class PcmCaptureProcessor extends AudioWorkletProcessor {
+        constructor(opts){
+          super();
+          this.batchSize = (opts.processorOptions && opts.processorOptions.batchSize) || 4096;
+          this.buf = new Float32Array(this.batchSize);
+          this.off = 0;
+        }
+        process(inputs){
+          const ch = inputs[0] && inputs[0][0];
+          if (ch){
+            let read = 0;
+            while (read < ch.length){
+              const take = Math.min(this.batchSize - this.off, ch.length - read);
+              this.buf.set(ch.subarray(read, read + take), this.off);
+              this.off += take;
+              read += take;
+              if (this.off === this.batchSize){
+                this.port.postMessage(this.buf, [this.buf.buffer]);
+                this.buf = new Float32Array(this.batchSize);
+                this.off = 0;
+              }
+            }
+          }
+          return true;
+        }
+      }
+      registerProcessor('pcm-capture-processor', PcmCaptureProcessor);
+    `;
+    const workletUrl = URL.createObjectURL(new Blob([workletSrc], {type: 'application/javascript'}));
+    try {
+      await audioCtx.audioWorklet.addModule(workletUrl);
+    } finally {
+      URL.revokeObjectURL(workletUrl);
+    }
+    procNode = new AudioWorkletNode(audioCtx, 'pcm-capture-processor', { processorOptions: { batchSize: 4096 } });
+
+    // Capture + VAD tick, once per batch delivered from the audio thread. dt is derived from
+    // the exact sample count of this batch (not a measured wall-clock delta), so it's correct
+    // even if this handler itself gets delayed — unlike the old rAF-driven version.
+    procNode.port.onmessage = (e) => {
       if (!running) return;
-      segFrames.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+      const samples = e.data;
+      segFrames.push(samples);
+
+      analyser.getByteFrequencyData(vadEnergyData);
+      let sum = 0;
+      for (let i=0;i<vadEnergyData.length;i++) sum += vadEnergyData[i];
+      const avg = sum / vadEnergyData.length;
+      liveEnergy = avg; // consumed by startLevelMeter()'s rAF loop for display only
+
+      const dt = (samples.length / audioCtx.sampleRate) * 1000;
+      const maxSegmentMs = parseInt(chunkLenEl.value, 10) * 1000;
+      if (avg >= SILENCE_THRESHOLD){
+        segHasSpeech = true;
+        segSpeechMs += dt;
+        segSilenceMs = 0;
+      } else {
+        segSilenceMs += dt;
+      }
+      segMs += dt;
+
+      if (segHasSpeech && segSilenceMs >= HANGOVER_MS && segSpeechMs >= MIN_SPEECH_MS){
+        flushSegment(true);                          // natural end of utterance
+      } else if (segHasSpeech && segMs >= maxSegmentMs){
+        flushSegment(true);                          // safety cap — continuous speech, no pause
+      } else if (!segHasSpeech && segMs >= IDLE_RESET_MS){
+        flushSegment(false);                         // nothing but silence — drop it, bound memory
+      }
     };
-    // ScriptProcessorNode only fires onaudioprocess while connected through to a
-    // destination. Route it through a silent gain rather than audioCtx.destination
-    // directly, so the mic audio is never actually played back out loud.
+
+    // AudioWorkletNode only runs while connected through to a destination. Route it through
+    // a near-silent (not exactly zero) gain rather than audioCtx.destination directly, so mic
+    // audio is never audibly looped back to the speakers. Deliberately not literal 0: Chrome
+    // can auto-suspend an AudioContext it judges to be producing pure silence, which would
+    // stop this worklet's process() callback from being called at all — 1e-6 (~-120dBFS) is
+    // silent to any human ear and far below the noise floor, but registers as non-silent
+    // output, so that heuristic (if it applies here) doesn't have a reason to trigger.
     silentGain = audioCtx.createGain();
-    silentGain.gain.value = 0;
+    silentGain.gain.value = 1e-6;
     sourceNode.connect(procNode);
     procNode.connect(silentGain);
     silentGain.connect(audioCtx.destination);
 
+    // Belt-and-suspenders: if the browser suspends the context anyway (backgrounded tab,
+    // power-saving heuristics — the exact mechanism varies by browser and isn't fully
+    // documented), resume it as soon as we notice, rather than silently losing audio for the
+    // rest of the call.
+    audioCtx.onstatechange = () => {
+      if (running && audioCtx.state === 'suspended') audioCtx.resume();
+    };
+
     segFrames = [];
     segHasSpeech = false;
     segSpeechMs = 0; segSilenceMs = 0; segMs = 0;
-    vadLastTs = null;
 
     startLevelMeter();
+
+    // Per-chunk transcribe/translate calls already update the SERVER dot on every attempt
+    // (see sendChunk()), but that only happens when there's speech to send — during a quiet
+    // stretch of the call, a whisper-server outage (or its recovery) wouldn't show up until
+    // the next chunk. This periodic poll closes that gap without needing any persistent
+    // connection or reconnect/backoff logic — every VAD-cut chunk is already an independent,
+    // stateless POST that naturally retries itself on the next segment.
+    healthPollInterval = setInterval(checkServer, 20000);
   }
 
   function stop(){
@@ -1117,12 +1184,13 @@
     // Send whatever speech was captured since the last cut immediately, rather than
     // waiting on a hangover timer that will now never fire.
     flushSegment(segHasSpeech);
+    if (healthPollInterval){ clearInterval(healthPollInterval); healthPollInterval = null; }
     if (levelRaf) cancelAnimationFrame(levelRaf);
     bars.forEach(b => { b.style.height='15%'; b.style.background='var(--hairline)'; });
-    if (procNode){ procNode.onaudioprocess = null; procNode.disconnect(); procNode = null; }
+    if (procNode){ procNode.port.onmessage = null; procNode.disconnect(); procNode = null; }
     if (silentGain){ silentGain.disconnect(); silentGain = null; }
     if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
-    if (audioCtx) audioCtx.close();
+    if (audioCtx){ audioCtx.onstatechange = null; audioCtx.close(); }
   }
 
   // ---------- Settings modal ----------
@@ -1142,6 +1210,13 @@
   settingsOverlay.addEventListener('click', (e) => { if (e.target === settingsOverlay) closeSettings(); });
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && settingsOverlay.classList.contains('open')) closeSettings();
+  });
+
+  // Second chance to catch a suspended AudioContext, on top of the onstatechange handler set
+  // up in start() — tab visibility is exactly the moment a suspend is most likely, so re-check
+  // right when the tab becomes visible again rather than waiting on the statechange event.
+  document.addEventListener('visibilitychange', () => {
+    if (running && audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
   });
 
   startBtn.addEventListener('click', start);
