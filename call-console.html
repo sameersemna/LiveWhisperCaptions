@@ -816,6 +816,14 @@
   // already mono raw PCM (getUserMedia requested channelCount:1), so no downmix needed.
   // async because resampleTo16k now renders through an OfflineAudioContext (see its
   // comment) — callers already fire-and-forget this (same as they did with sendChunk).
+  //
+  // The transcript/translation DOM lines for this segment are reserved right here — in
+  // the exact order segments are cut from the audio — before the await below, not inside
+  // sendChunk() after it. Consecutive segments' async work (resample, then two network
+  // requests) has no guaranteed ordering: segment N+1 could finish resampling or respond
+  // over the network before segment N does. sendChunk() only ever fills in a
+  // *already-positioned* placeholder line, never appends a new one, so display order is
+  // FIFO by audio order no matter which segment's async work happens to finish first.
   async function flushSegment(send){
     const frames = segFrames;
     segFrames = [];
@@ -828,10 +836,17 @@
     const merged = new Float32Array(total);
     let off = 0;
     for (const f of frames){ merged.set(f, off); off += f.length; }
+    const audioMs = Math.round((total / audioCtx.sampleRate) * 1000);
+
+    const t0 = performance.now();
+    litJack();
+    const dePending = addLine(deTranscript, deEmpty, `…transcribing (${(audioMs/1000).toFixed(1)}s audio)`, 'de-text pending');
+    const enPending = addLine(enTranscript, enEmpty, '…translating', 'en-text pending');
+    dePending.classList.add('pending');
+    enPending.classList.add('pending');
 
     const mono16k = await resampleTo16k(merged, audioCtx.sampleRate);
-    const audioMs = Math.round((total / audioCtx.sampleRate) * 1000);
-    sendChunk(encodeWav(mono16k, 16000), audioMs);
+    sendChunk(encodeWav(mono16k, 16000), audioMs, t0, dePending, enPending);
   }
 
   // Rolling window of recent chunk timings, purely for eyeballing real-call latency —
@@ -865,15 +880,12 @@
     fd.append('temperature_inc', '0.2');
   }
 
-  async function sendChunk(wavBlob, audioMs){
-    litJack();
-
-    const dePending = addLine(deTranscript, deEmpty, `…transcribing (${(audioMs/1000).toFixed(1)}s audio)`, 'de-text pending');
-    const enPending = addLine(enTranscript, enEmpty, '…translating', 'en-text pending');
-    dePending.classList.add('pending');
-    enPending.classList.add('pending');
-
-    const t0 = performance.now();
+  // dePending/enPending are placeholder lines already positioned in the DOM (by
+  // flushSegment(), in audio order) — this only ever fills them in, never appends new
+  // ones, so response-arrival order (which can differ from audio order) can't reorder
+  // what's on screen. t0 is likewise measured by flushSegment() before the resample/
+  // network work started, so latency numbers include that time too.
+  async function sendChunk(wavBlob, audioMs, t0, dePending, enPending){
     const sourceLang = sourceLangEl.value;
 
     // Shared cue timing for both panes: the chunk boundary (t0, i.e. "now") is the cue's
