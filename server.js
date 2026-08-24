@@ -57,9 +57,13 @@ const whisperHostname = WHISPER_HOST.replace(/^https?:\/\//, '').split(':')[0];
 const OLLAMA_URL = cfg.OLLAMA_URL || `http://${whisperHostname}:11434`;
 const OLLAMA_MODEL = cfg.OLLAMA_MODEL || '';
 // Priority: explicit TRANSLATE_MODE > llm (if a model is configured) > whisper (double pass).
-// 'google' uses Google's free unofficial translate endpoint — a real NMT model, no chat-model
-// refusals/commentary. Recommended over 'llm' for translation quality.
-const TRANSLATE_MODE = cfg.TRANSLATE_MODE || (OLLAMA_MODEL ? 'llm' : 'whisper');
+// 'cloud' tries Google's free unofficial translate endpoint first (real NMT, no chat-model
+// refusals/commentary), falling back to other free/keyless providers if Google is
+// unreachable or rate-limited — see callCloudTranslate() above. Recommended over 'llm' for
+// translation quality. 'google' is kept as an accepted alias for 'cloud' so existing .env
+// files with TRANSLATE_MODE="google" keep working unchanged after this rename.
+const TRANSLATE_MODE_RAW = cfg.TRANSLATE_MODE || (OLLAMA_MODEL ? 'llm' : 'whisper');
+const TRANSLATE_MODE = TRANSLATE_MODE_RAW === 'google' ? 'cloud' : TRANSLATE_MODE_RAW;
 
 const HTML_FILE = path.join(__dirname, 'call-console.html');
 const FAVICON_FILE = path.join(__dirname, 'favicon.ico');
@@ -133,14 +137,61 @@ async function callOllamaTranslate(sourceText, sourceLangName) {
   return (data.response || '').trim();
 }
 
+// ---------- 'cloud' translate: Google first, falling back to other free/keyless
+// unofficial-but-stable endpoints if Google is unreachable or rate-limited. Google's
+// translate.googleapis.com endpoint is unofficial/undocumented and has no SLA — it
+// started returning HTTP 429 ("your computer or network may be sending automated
+// queries") in practice on 2026-08-22, which is exactly the trade-off already noted
+// under "Translate modes" above. Each provider function throws on any failure
+// (non-2xx, malformed body, or an explicit quota/error signal in an otherwise-200
+// response) so callCloudTranslate() can uniformly try the next one.
 async function callGoogleTranslate(sourceText, sourceLangCode) {
   const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${encodeURIComponent(sourceLangCode)}&tl=en&dt=t&q=${encodeURIComponent(sourceText)}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error('google translate HTTP ' + res.status);
   const data = await res.json();
   // Response shape: [[[translatedChunk, originalChunk, ...], ...], ...]
-  const translated = (data[0] || []).map(seg => seg[0]).join('');
-  return translated.trim();
+  const translated = (data[0] || []).map(seg => seg[0]).join('').trim();
+  if (!translated) throw new Error('google translate returned empty text');
+  return translated;
+}
+
+// MyMemory (api.mymemory.translated.net) — genuinely free, no signup, no API key, CORS-
+// enabled, documented usage limits (not a reverse-engineered trick like Google's or
+// Bing's). Anonymous quota is 5000 chars/day per calling IP; quality is generally more
+// literal than Google's NMT but perfectly usable as a fallback, not a first choice.
+async function callMyMemoryTranslate(sourceText, sourceLangCode) {
+  const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(sourceText)}&langpair=${encodeURIComponent(sourceLangCode)}|en`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('mymemory HTTP ' + res.status);
+  const data = await res.json();
+  // MyMemory can return HTTP 200 with a quota-exceeded warning *as* the translated text,
+  // rather than a non-2xx status — quotaFinished/responseStatus catch that explicitly.
+  if (data.quotaFinished) throw new Error('mymemory daily quota exhausted');
+  if (data.responseStatus && Number(data.responseStatus) !== 200) throw new Error('mymemory status ' + data.responseStatus);
+  const translated = (data.responseData && data.responseData.translatedText || '').trim();
+  if (!translated) throw new Error('mymemory returned empty text');
+  return translated;
+}
+
+const CLOUD_TRANSLATE_PROVIDERS = [
+  ['google', callGoogleTranslate],
+  ['mymemory', callMyMemoryTranslate],
+];
+
+async function callCloudTranslate(sourceText, sourceLangCode) {
+  let lastErr;
+  for (const [name, fn] of CLOUD_TRANSLATE_PROVIDERS) {
+    try {
+      const translated = await fn(sourceText, sourceLangCode);
+      if (lastErr) log(`cloud translate fell back to ${name}`, 0);
+      return translated;
+    } catch (err) {
+      log(`cloud translate: ${name} failed (${err.message}), trying next`, 0);
+      lastErr = err;
+    }
+  }
+  throw new Error('all cloud translate providers failed: ' + lastErr.message);
 }
 
 const LANGUAGE_NAMES = {
@@ -209,10 +260,11 @@ async function requestHandler(req, res) {
     return;
   }
 
-  // Translate: 'google' (recommended — real NMT, no chat-model refusals/commentary),
-  // 'llm' (Ollama text-translation), or 'whisper' (second full audio pass).
+  // Translate: 'cloud' (recommended — Google first, falling back to other free providers;
+  // see callCloudTranslate() above), 'llm' (Ollama text-translation), or 'whisper' (second
+  // full audio pass).
   if (req.method === 'POST' && url === '/translate') {
-    if (TRANSLATE_MODE === 'google' || TRANSLATE_MODE === 'llm') {
+    if (TRANSLATE_MODE === 'cloud' || TRANSLATE_MODE === 'llm') {
       const t0 = Date.now();
       try {
         const bodyBuf = await readBody(req);
@@ -224,10 +276,10 @@ async function requestHandler(req, res) {
         }
         const langCode = sourceLang || 'de';
         const langName = LANGUAGE_NAMES[langCode] || langCode;
-        const translated = TRANSLATE_MODE === 'google'
-          ? await callGoogleTranslate(text, langCode)
+        const translated = TRANSLATE_MODE === 'cloud'
+          ? await callCloudTranslate(text, langCode)
           : await callOllamaTranslate(text, langName);
-        log(`translate (${TRANSLATE_MODE === 'google' ? 'google' : 'ollama/' + OLLAMA_MODEL})`, Date.now() - t0);
+        log(`translate (${TRANSLATE_MODE === 'cloud' ? 'cloud' : 'ollama/' + OLLAMA_MODEL})`, Date.now() - t0);
         res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
         res.end(translated);
       } catch (err) {
@@ -274,7 +326,7 @@ server.listen(PORT, () => {
     console.log(`   not other LAN machines. See CLAUDE.md for how to generate a self-signed cert.)`);
   }
   console.log(`Whisper backend:      ${WHISPER_URL}`);
-  const modeDesc = TRANSLATE_MODE === 'google' ? 'Google Translate (unofficial endpoint)'
+  const modeDesc = TRANSLATE_MODE === 'cloud' ? `cloud (${CLOUD_TRANSLATE_PROVIDERS.map(p => p[0]).join(' → ')})`
     : TRANSLATE_MODE === 'llm' ? `Ollama (${OLLAMA_URL}, model=${OLLAMA_MODEL})`
     : 'double whisper pass';
   console.log(`Translate mode:       ${TRANSLATE_MODE} — ${modeDesc}`);

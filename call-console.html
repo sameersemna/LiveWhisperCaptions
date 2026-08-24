@@ -584,6 +584,17 @@
     /vielen dank f(ü|u)rs zuschauen/i,
     /(like|abonnier).{0,20}(kanal|glocke)/i,
     /bis zum n(ä|a)chsten mal/i,
+    // Bare "Vielen Dank."/"Danke schön." etc. — a classic Whisper silence-hallucination
+    // output distinct from the "...fürs Zuschauen" YouTube-outro pattern above: here the
+    // *entire* segment is nothing but a short stock thank-you, which is what Whisper
+    // emits on near-silence/noise, not a real utterance. Anchored to the whole trimmed
+    // text (^...$) specifically so it does NOT match a real sentence that happens to
+    // contain "vielen Dank" mid-sentence, e.g. "Vielen Dank für Ihre Geduld, ich prüfe
+    // das kurz" — only when that's genuinely the whole thing. hallucinations.txt (used by
+    // call-transcribe-live.sh) already listed "vielen dank"/"danke"/"danke schön" as bare
+    // substrings — this brings the webapp's separate list into parity for this phrase
+    // specifically, not a full unification (see the dual-list gotcha in CLAUDE.md).
+    /^(vielen )?danke?( schön)?[.!]?$/i,
   ];
   // Whisper repetition-loop failure: the decoder gets stuck re-emitting the same token
   // ("sehr, sehr, sehr, ..." dozens of times) instead of finishing the sentence. Distinct
@@ -680,7 +691,7 @@
       const cfg = await r.json();
       serverUrlEl.value = cfg.whisperUrl;
       translateMode = cfg.translateMode || 'whisper';
-      footerRight.textContent = translateMode === 'google' ? 'large-v3 · google translate'
+      footerRight.textContent = translateMode === 'cloud' ? 'large-v3 · cloud translate (google → mymemory)'
         : translateMode === 'llm' ? `large-v3 · ollama translate (${cfg.ollamaModel})`
         : 'large-v3 · dual whisper pass';
       if (cfg.btSource){
@@ -929,12 +940,12 @@
       throw err;
     });
 
-    // Translation: LLM mode waits on the transcript (sequential, but cheap);
-    // whisper mode fires immediately in parallel with the transcribe request
-    // (two independent audio passes, same as before).
+    // Translation: LLM and cloud modes wait on the transcript (sequential, but cheap —
+    // both translate text, not audio); whisper mode fires immediately in parallel with
+    // the transcribe request (two independent audio passes, same as before).
     const translateTask = (async () => {
       let text;
-      if (translateMode === 'llm' || translateMode === 'google'){
+      if (translateMode === 'llm' || translateMode === 'cloud'){
         const deText = await transcribeTask; // rejects with HallucinationSkip if filtered above
         const tS = performance.now();
         const res = await fetch('/translate', {
