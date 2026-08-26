@@ -62,6 +62,16 @@ SILENCE_DURATION=0.3
 RMS_THRESHOLD_DB=-40
 # Minimum transcription length to avoid hallucinations
 MIN_TEXT_LENGTH=20
+# whisper.cpp's own no-speech gate (confirmed real form field, server default 0.6 — see
+# CLAUDE.md). Raised here as a starting point after a real incident (2026-08-22) where
+# has_speech() let noisy/near-silent audio through and Whisper confidently hallucinated
+# fluent, varied English sentences on it rather than recognizing "no real speech" — a
+# failure mode temperature_inc's retry mechanism doesn't catch, since a fluent hallucinated
+# sentence can pass whisper's own compression-ratio/avg-logprob quality checks just fine.
+# This is the same "tune against real audio, don't guess" territory as SILENCE_THRESHOLD_DB
+# above — 0.7 is a first move, not a validated final value; raise further if hallucinated
+# full sentences keep appearing, lower if real quiet speech starts getting dropped.
+NO_SPEECH_THOLD=0.7
 
 # Common Whisper hallucinations to filter out (case-insensitive substrings),
 # read directly from hallucinations.txt — same convention this script
@@ -101,8 +111,16 @@ has_speech() {
   local idx="$2"
 
   # Method 1: volumedetect for mean_volume (RMS equivalent)
+  # -loglevel info, not error: volumedetect/silencedetect (both filters used in this
+  # function) report their stats (mean_volume, silence_start/end/duration) via ffmpeg's
+  # own INFO-level logging, not as filter output on stdout. -loglevel error silently
+  # discards that entire line — confirmed live (2026-08-22): with -loglevel error this
+  # function's grep patterns below never matched anything, on ANY audio, so both
+  # detection methods always fell through and has_speech() always returned "has speech"
+  # regardless of actual content. That's the real cause of a real incident: every chunk,
+  # including pure silence, was being sent to Whisper, which hallucinated freely on it.
   local vol_info
-  vol_info=$(ffmpeg -hide_banner -loglevel error -i "$chunk_file" \
+  vol_info=$(ffmpeg -hide_banner -loglevel info -i "$chunk_file" \
     -af "volumedetect" -f null - 2>&1)
 
   local mean_volume
@@ -115,9 +133,10 @@ has_speech() {
     fi
   fi
 
-  # Method 2: silencedetect as backup
+  # Method 2: silencedetect as backup (see the -loglevel note on Method 1 above — applies
+  # here too, silencedetect's silence_start/end/duration lines are also INFO-level)
   local silence_info
-  silence_info=$(ffmpeg -hide_banner -loglevel error -i "$chunk_file" \
+  silence_info=$(ffmpeg -hide_banner -loglevel info -i "$chunk_file" \
     -af "silencedetect=noise=${SILENCE_THRESHOLD_DB}dB:d=${SILENCE_DURATION}" \
     -f null - 2>&1)
 
@@ -261,13 +280,21 @@ process_chunk() {
     return 0
   fi
 
+  # temperature/temperature_inc: same values the browser console settled on after its own
+  # repetition-loop hallucination incident (see CLAUDE.md) — 0 for a greedy first pass,
+  # 0.2 to keep whisper's own escalating-temperature retry alive rather than disabling it.
+  # no_speech_thold: see NO_SPEECH_THOLD above.
+
   # Transcription (original language)
   local transcription
   transcription=$(curl -s "http://${WHISPER_HOST}/inference" \
     -F file="@$chunk_file" \
     -F language="$LANGUAGE" \
     -F translate="false" \
-    -F response_format="text")
+    -F response_format="text" \
+    -F temperature="0" \
+    -F temperature_inc="0.2" \
+    -F no_speech_thold="$NO_SPEECH_THOLD")
   transcription=$(trim "$transcription")
 
   # Translation (to English)
@@ -276,7 +303,10 @@ process_chunk() {
     -F file="@$chunk_file" \
     -F language="$LANGUAGE" \
     -F translate="true" \
-    -F response_format="text")
+    -F response_format="text" \
+    -F temperature="0" \
+    -F temperature_inc="0.2" \
+    -F no_speech_thold="$NO_SPEECH_THOLD")
   translation=$(trim "$translation")
 
   # Filter out very short results (likely hallucinations)

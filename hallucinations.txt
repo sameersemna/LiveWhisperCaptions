@@ -1,12 +1,13 @@
 # Known Whisper hallucination phrases — stock subtitle/broadcaster boilerplate
-# that shows up on silence or near-silence, not real transcription.
+# (and, below, specific hallucinated sentences observed in practice) that show
+# up on silence or near-silence, not real transcription.
 #
 # One phrase per line, matched as a case-insensitive substring (not a regex).
-# Blank lines and lines starting with # are ignored. Served by server.js at
-# GET /hallucinations for anything that wants to filter on this list —
-# currently call-transcribe-live.sh. (call-console.html's browser-side
-# filter is a separate, regex-based list — HALLUCINATION_PATTERNS in the
-# HTML — not yet unified with this file; see CLAUDE.md.)
+# Blank lines and lines starting with # are ignored. Read directly by
+# call-transcribe-live.sh — no server involved (see CLAUDE.md; a GET
+# /hallucinations endpoint on server.js was tried and deliberately removed).
+# call-console.html's browser-side filter is a separate, regex-based list —
+# HALLUCINATION_PATTERNS in the HTML — not yet unified with this file.
 vielen dank
 vielen dank.
 subtitles by
@@ -19,3 +20,16 @@ thank you
 thanks
 subtitle
 community
+untertitel
+
+# Specific hallucinated sentences observed in practice (2026-08-22) — Whisper
+# fabricating fluent, varied, subtitle-corpus-flavored English on near-silent/
+# noisy audio that passed has_speech(). Not stock boilerplate like the phrases
+# above, and there's no small fixed set to exhaustively list (Whisper can
+# hallucinate essentially unlimited sentence variety this way) — these are
+# just the specific ones seen recurring in one session, added as a stopgap
+# alongside the no_speech_thold/temperature_inc tuning below, which addresses
+# the actual root cause. Add more here as you spot them, but don't expect
+# this list alone to solve the problem — see the gotcha in CLAUDE.md.
+the german national anthem
+the great gildersleeve
