@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash -n call-transcribe-live.sh)",
+      "Bash(bash -n call-transcribe.sh)",
+      "Bash(./call-transcribe-live.sh --list-devices)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(bash call-transcribe-live.sh --list-devices)"
+    ]
+  }
+}

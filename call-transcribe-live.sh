@@ -6,9 +6,12 @@
 # speech-containing chunks for transcription and translation.
 #
 # Requires: ffmpeg, curl
+# Works on Linux (PulseAudio) and macOS (CoreAudio via ffmpeg's avfoundation
+# input) — see start_capture() and the CLAUDE.md gotcha for details.
 #
 # Usage:
 #   ./call-transcribe-live.sh [LANG_CODE]
+#   ./call-transcribe-live.sh --list-devices   # list audio input devices, then exit
 #
 #   LANG_CODE  Source language (default: de). Examples: de, en, fr, es, it, nl...
 #
@@ -18,6 +21,36 @@
 # get environment variables from .env file
 if [ -f .env ]; then
   export $(cat .env | sed 's/#.*//g' | xargs)
+fi
+
+# Linux uses PulseAudio (-f pulse); macOS has no PulseAudio by default and
+# reaches CoreAudio via ffmpeg's avfoundation input instead — see
+# start_capture() below and the CLAUDE.md gotcha for the full story.
+OS_NAME="$(uname -s)"
+
+# --list-devices / -l: print the platform-appropriate audio device list and
+# exit, so you can find what to put in BT_SOURCE (a PulseAudio source name on
+# Linux, an avfoundation device index/name on macOS) without reading ffmpeg
+# docs. Checked before LANGUAGE so it works as a standalone command.
+if [ "$1" = "--list-devices" ] || [ "$1" = "-l" ]; then
+  case "$OS_NAME" in
+    Darwin)
+      ffmpeg -f avfoundation -list_devices true -i "" 2>&1 | sed -n '/AVFoundation audio devices/,$p'
+      ;;
+    Linux)
+      if command -v pactl >/dev/null 2>&1; then
+        pactl list sources short
+      else
+        echo "pactl not found — install pulseaudio-utils to list sources." >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "Unsupported OS: ${OS_NAME}. This script supports Linux and macOS." >&2
+      exit 1
+      ;;
+  esac
+  exit 0
 fi
 
 # Source language from CLI arg (default: de)
@@ -94,7 +127,7 @@ cleanup() {
   echo -e "\n${C_AMBER}Stopping...${C_RESET}"
   kill "$CAPTURE_PID" 2>/dev/null
   rm -rf "$TMPDIR"
-  rm -f "${SRT_SOURCE_FILE}.lock" "${SRT_EN_FILE}.lock"
+  rmdir "${SRT_SOURCE_FILE}.lockdir" "${SRT_EN_FILE}.lockdir" 2>/dev/null
   echo "${C_GREEN}Cleaned up temporary files.${C_RESET}"
   sort_srt_file "$SRT_SOURCE_FILE"
   sort_srt_file "$SRT_EN_FILE"
@@ -123,8 +156,14 @@ has_speech() {
   vol_info=$(ffmpeg -hide_banner -loglevel info -i "$chunk_file" \
     -af "volumedetect" -f null - 2>&1)
 
+  # sed -E, not grep -oP: -P (PCRE) is a GNU grep extension that BSD grep
+  # (macOS default) doesn't support — it would fail silently there, leaving
+  # mean_volume always empty and has_speech() always falling through to
+  # "has speech", the same class of silent VAD-gate failure the -loglevel
+  # info fix above addressed for a different tool gap. sed -E's POSIX ERE
+  # (character classes + backreference) works identically on GNU and BSD sed.
   local mean_volume
-  mean_volume=$(echo "$vol_info" | grep -oP 'mean_volume:\s*\K[-]?[\d.]+' | head -1)
+  mean_volume=$(echo "$vol_info" | sed -nE 's/.*mean_volume:[[:space:]]*(-?[0-9.]+).*/\1/p' | head -1)
 
   if [ -n "$mean_volume" ]; then
     # mean_volume is negative dB, more negative = quieter
@@ -143,7 +182,7 @@ has_speech() {
   # If silencedetect found silence spanning most of the chunk, skip it
   if echo "$silence_info" | grep -q "silence_end"; then
     local silence_dur
-    silence_dur=$(echo "$silence_info" | grep -oP 'silence_duration: \K[\d.]+' | head -1)
+    silence_dur=$(echo "$silence_info" | sed -nE 's/.*silence_duration: ([0-9.]+).*/\1/p' | head -1)
     if [ -n "$silence_dur" ]; then
       local threshold
       threshold=$(echo "$CHUNK_SECONDS * 0.8" | bc -l 2>/dev/null || echo "2.4")
@@ -206,16 +245,30 @@ srt_timestamp() {
 # comes back first appends first), so blocks may land on disk out of sequence,
 # but each block's own number/timestamps are always correct regardless of
 # write order — SRT players key off timestamps, not file position.
+# Portable mutual-exclusion lock: mkdir is atomic on every POSIX filesystem,
+# so this needs no extra tool. Deliberately not flock — flock is util-linux,
+# Linux-only, not shipped on macOS; using it there would fail silently there
+# too (the write still happens after the failed flock command, just without
+# the corruption protection flock is meant to provide) rather than erroring
+# loudly, which is exactly the kind of gap this project has been bitten by
+# before (see the -loglevel error gotcha in CLAUDE.md).
+acquire_lock() {
+  while ! mkdir "$1" 2>/dev/null; do sleep 0.05; done
+}
+release_lock() {
+  rmdir "$1" 2>/dev/null
+}
+
 write_srt_block() {
   local file="$1" idx="$2" text="$3"
   local seq=$(( idx + 1 ))
   local start_ts end_ts
   start_ts=$(srt_timestamp $(( idx * CHUNK_SECONDS )))
   end_ts=$(srt_timestamp $(( (idx + 1) * CHUNK_SECONDS )))
-  (
-    flock -x 201
-    printf '%d\n%s --> %s\n%s\n\n' "$seq" "$start_ts" "$end_ts" "$text" >> "$file"
-  ) 201>>"${file}.lock"
+  local lockdir="${file}.lockdir"
+  acquire_lock "$lockdir"
+  printf '%d\n%s --> %s\n%s\n\n' "$seq" "$start_ts" "$end_ts" "$text" >> "$file"
+  release_lock "$lockdir"
 }
 
 # write_srt_block() only guarantees blocks don't corrupt each other on
@@ -348,13 +401,41 @@ echo "${C_GRAY}Saving SRT to ${SRT_SOURCE_FILE} and ${SRT_EN_FILE}${C_RESET}"
 echo ""
 
 # Use ffmpeg segment muxer to write fixed-duration chunk files directly.
-ffmpeg -loglevel error \
-  -f pulse -i "$BT_SOURCE" \
-  -ar 16000 -ac 1 -acodec pcm_s16le \
-  -f segment -segment_time "$CHUNK_SECONDS" -segment_format wav \
-  -reset_timestamps 1 \
-  "${TMPDIR}/chunk_%03d.wav" &
-CAPTURE_PID=$!
+# Capture input is the one genuinely OS-specific piece: Linux reaches the
+# phone's HFP mic via PulseAudio (-f pulse), macOS has no PulseAudio by
+# default and reaches the same CoreAudio device via -f avfoundation instead.
+# BT_SOURCE is reused as-is on both platforms — a PulseAudio source name on
+# Linux, an avfoundation device index or exact device name on macOS (see
+# --list-devices above) — rather than adding a second, platform-specific env
+# var for what is conceptually the same "which mic" setting.
+start_capture() {
+  local out_pattern="$1"
+  case "$OS_NAME" in
+    Darwin)
+      ffmpeg -loglevel error \
+        -f avfoundation -i ":${BT_SOURCE}" \
+        -ar 16000 -ac 1 -acodec pcm_s16le \
+        -f segment -segment_time "$CHUNK_SECONDS" -segment_format wav \
+        -reset_timestamps 1 \
+        "$out_pattern" &
+      ;;
+    Linux)
+      ffmpeg -loglevel error \
+        -f pulse -i "$BT_SOURCE" \
+        -ar 16000 -ac 1 -acodec pcm_s16le \
+        -f segment -segment_time "$CHUNK_SECONDS" -segment_format wav \
+        -reset_timestamps 1 \
+        "$out_pattern" &
+      ;;
+    *)
+      echo "${C_RED}Unsupported OS: ${OS_NAME}. This script supports Linux and macOS.${C_RESET}" >&2
+      exit 1
+      ;;
+  esac
+  CAPTURE_PID=$!
+}
+
+start_capture "${TMPDIR}/chunk_%03d.wav"
 
 # Allow capture to start and first chunk to be written
 sleep "$((CHUNK_SECONDS + 1))"
