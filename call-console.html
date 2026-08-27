@@ -351,7 +351,7 @@
       <div class="status"><span class="dot" id="dotServer"></span>SERVER</div>
       <div class="status"><span class="dot" id="dotLive"></span>LIVE</div>
       <div class="meter" id="meter"></div>
-      <span id="energyReadout" style="font-family:var(--mono); font-size:10px; color:var(--text-faint); min-width:52px;">lvl: —</span>
+      <span id="energyReadout" style="font-family:var(--mono); font-size:10px; color:var(--text-faint); min-width:88px;">lvl: —</span>
 
       <span class="header-divider"></span>
 
@@ -547,6 +547,7 @@
   let levelRaf = null;
   let healthPollInterval = null;
   let liveEnergy = 0;
+  let liveThreshold = 0; // the *current* adaptive threshold — see the noise-floor tracker below
   let callStartMs = 0; // performance.now() at call start — SRT cue times are relative to this
 
   // Cues actually rendered on screen, in call-relative ms — exported as SRT on demand.
@@ -554,16 +555,42 @@
   let deCues = [];
   let enCues = [];
 
-  const SILENCE_THRESHOLD = 6; // avg byte-frequency level (0-255); tune using the live "lvl:" readout in the header
+  // ---------- Adaptive noise-floor tracker ----------
+  // Replaces a single hardcoded SILENCE_THRESHOLD (2026-08-22) after a real incident: this
+  // project's actual background noise floor varies by BT link/environment (one real call
+  // measured 16-21 on this 0-255 scale during silence, against a threshold that had been
+  // set to 6 — so noise was constantly passing the VAD gate, reaching Whisper, and Whisper
+  // was reliably hallucinating "Vielen Dank." on it). A fixed number needs a human watching
+  // the "lvl:" readout and manually recalibrating every time the noise floor changes call to
+  // call. This tracks the noise floor continuously instead: NOISE_FLOOR_ALPHA is an
+  // exponential-moving-average rate applied only to readings currently classified as
+  // silence (so real speech energy never pulls the floor upward), bootstrapped from the
+  // very first reading of the call. The live threshold is noiseFloor scaled by
+  // NOISE_MARGIN_MULT and floored by NOISE_MARGIN_ADD above it — the max() of the two
+  // because a purely multiplicative margin is too tight in a near-silent room (a noise
+  // floor near 0 would give an almost-zero threshold) and a purely additive one is too
+  // tight in a loud one, so both bounds are applied and the larger wins. MIN/MAX_THRESHOLD
+  // are a sanity clamp against a pathological run of readings, not expected to bind in
+  // practice. Checked against the real incident's own numbers as a sanity test: a ~18
+  // noise floor (mid of the observed 16-21 range) works out to a ~25 threshold here — the
+  // same value that incident was manually corrected to, which is reassuring but not proof
+  // this generalizes; if it turns out wrong for some environment, these are the constants
+  // to retune, not a return to a hardcoded lvl number.
+  const NOISE_FLOOR_ALPHA = 0.05;
+  const NOISE_MARGIN_ADD = 6;
+  const NOISE_MARGIN_MULT = 1.4;
+  const MIN_THRESHOLD = 8;
+  const MAX_THRESHOLD = 80;
+  let noiseFloor = null; // bootstrapped from the first reading of the call, see start()
 
   // ---------- VAD endpointer ----------
   // Capture is one continuous PCM stream for the whole call (via an AudioWorkletNode, see
   // start()); this state machine decides where to cut it into chunks to send, using the
-  // same avg frequency-domain energy metric as SILENCE_THRESHOLD/the level meter above —
-  // one threshold, one number to tune, both places. The tick itself runs inside the
-  // worklet's port.onmessage handler in start(), not here — dt comes from the exact sample
-  // count of each audio-thread batch (samples.length / sampleRate), not a wall-clock delta,
-  // so it stays correct even if the main thread is busy or the tab is backgrounded.
+  // same adaptive threshold as the level meter above — one number, computed once per
+  // reading, both roles. The tick itself runs inside the worklet's port.onmessage handler
+  // in start(), not here — dt comes from the exact sample count of each audio-thread batch
+  // (samples.length / sampleRate), not a wall-clock delta, so it stays correct even if the
+  // main thread is busy or the tab is backgrounded.
   const HANGOVER_MS = 600;      // trailing silence required after speech before cutting a chunk
   const MIN_SPEECH_MS = 250;    // ignore blips shorter than this — not worth a round trip
   const IDLE_RESET_MS = 2000;   // drop accumulated pure-silence audio after this long (bounds memory)
@@ -999,7 +1026,7 @@
     }catch(e){
       if (e instanceof HallucinationSkip){
         setDot(dotServer, 'green');
-        footerLeft.textContent = `chunk filtered — hallucination pattern (lvl ${liveEnergy.toFixed(1)}) · ${fmtTime()}`;
+        footerLeft.textContent = `chunk filtered — hallucination pattern (lvl ${liveEnergy.toFixed(1)}/${liveThreshold.toFixed(1)}) · ${fmtTime()}`;
       } else {
         setDot(dotServer, 'red');
         footerLeft.textContent = 'error: ' + e.message;
@@ -1013,13 +1040,15 @@
   // tab, which is exactly when a live-call user is likely to alt-tab away, and cutting VAD
   // segments off a stalled rAF clock was producing wildly wrong segment boundaries — the
   // actual cause of the accuracy regression this function used to also be responsible for.
-  // liveEnergy is still read here for display, but it's now written by the worklet handler,
-  // not measured in this loop.
+  // liveEnergy/liveThreshold are still read here for display, but written by the worklet
+  // handler, not measured in this loop. Showing the threshold alongside the level (not just
+  // the level against an invisible hardcoded number) makes the adaptive tracker's current
+  // state visible/debuggable the same way the old fixed SILENCE_THRESHOLD was meant to be.
   function startLevelMeter(){
     const draw = () => {
       const avg = liveEnergy;
-      energyReadout.textContent = 'lvl: ' + avg.toFixed(1);
-      energyReadout.style.color = avg < SILENCE_THRESHOLD ? 'var(--text-faint)' : 'var(--green)';
+      energyReadout.textContent = `lvl: ${avg.toFixed(1)} / ${liveThreshold.toFixed(1)}`;
+      energyReadout.style.color = avg < liveThreshold ? 'var(--text-faint)' : 'var(--green)';
       const activeCount = Math.round((avg/255) * BAR_COUNT * 1.6);
       bars.forEach((b,i) => {
         const on = i < activeCount;
@@ -1141,14 +1170,26 @@
       const avg = sum / vadEnergyData.length;
       liveEnergy = avg; // consumed by startLevelMeter()'s rAF loop for display only
 
+      // Adaptive threshold — see the tracker's own comment above for the full rationale.
+      // Bootstrap on the very first reading of the call rather than starting at 0, so the
+      // first ~1s isn't wrongly treated as "way above threshold" before any real estimate
+      // exists.
+      if (noiseFloor === null) noiseFloor = avg;
+      const threshold = Math.min(MAX_THRESHOLD, Math.max(MIN_THRESHOLD,
+        Math.max(noiseFloor + NOISE_MARGIN_ADD, noiseFloor * NOISE_MARGIN_MULT)));
+      liveThreshold = threshold; // consumed by startLevelMeter()'s rAF loop for display only
+
       const dt = (samples.length / audioCtx.sampleRate) * 1000;
       const maxSegmentMs = parseInt(chunkLenEl.value, 10) * 1000;
-      if (avg >= SILENCE_THRESHOLD){
+      if (avg >= threshold){
         segHasSpeech = true;
         segSpeechMs += dt;
         segSilenceMs = 0;
       } else {
         segSilenceMs += dt;
+        // Only readings currently classified as silence feed the noise-floor estimate —
+        // real speech energy never pulls it upward, only actual quiet stretches do.
+        noiseFloor = noiseFloor * (1 - NOISE_FLOOR_ALPHA) + avg * NOISE_FLOOR_ALPHA;
       }
       segMs += dt;
 
@@ -1185,6 +1226,8 @@
     segFrames = [];
     segHasSpeech = false;
     segSpeechMs = 0; segSilenceMs = 0; segMs = 0;
+    noiseFloor = null; // re-bootstrap the noise floor fresh each call — a new call may be a
+                        // different environment/BT link entirely, not a continuation of the last
 
     startLevelMeter();
 
