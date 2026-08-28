@@ -85,10 +85,12 @@ MICRO_CHUNK_SECONDS=1
 # after roughly one micro-chunk's worth of silence following speech.
 HANGOVER_SECONDS=1
 # Safety cap: force a cut even with no pause, so one long run-on sentence with no
-# breath doesn't grow unbounded. 15s per user decision (2026-08-27) — long enough
-# for a full sentence, short enough to keep latency/hallucination risk in check,
-# matching the reasoning already used for the browser console's own VAD cap.
-MAX_SEGMENT_SECONDS=15
+# breath doesn't grow unbounded. Lowered from 15s to 10s per user decision
+# (2026-08-28) — 15s was letting too much rambling, multi-exchange dialogue pile
+# up under one timestamp before cutting (see a real transcript sample from that
+# session for what this looked like in practice). 10s still covers a full
+# sentence in normal speech, tighter latency/hallucination-risk ceiling than 15s.
+MAX_SEGMENT_SECONDS=10
 
 # ---------- SRT transcript export ----------
 # Persists this call's transcript to disk as two SRT files (source language +
@@ -159,18 +161,31 @@ has_speech() {
   local chunk_file="$1"
   local idx="$2"
 
-  # Method 1: volumedetect for mean_volume (RMS equivalent)
-  # -loglevel info, not error: volumedetect/silencedetect (both filters used in this
-  # function) report their stats (mean_volume, silence_start/end/duration) via ffmpeg's
-  # own INFO-level logging, not as filter output on stdout. -loglevel error silently
-  # discards that entire line — confirmed live (2026-08-22): with -loglevel error this
-  # function's grep patterns below never matched anything, on ANY audio, so both
-  # detection methods always fell through and has_speech() always returned "has speech"
-  # regardless of actual content. That's the real cause of a real incident: every chunk,
-  # including pure silence, was being sent to Whisper, which hallucinated freely on it.
-  local vol_info
-  vol_info=$(ffmpeg -hide_banner -loglevel info -i "$chunk_file" \
-    -af "volumedetect" -f null - 2>&1)
+  # Both filters chained into ONE ffmpeg invocation via -af "volumedetect,silencedetect=..."
+  # rather than two separate ffmpeg processes — a real, measured performance fix
+  # (2026-08-28). Two sequential ffmpeg calls took ~1.08s of wall time per has_speech()
+  # call, but the main loop invokes this once per MICRO_CHUNK_SECONDS=1 — meaning the VAD
+  # check alone took *longer* than the real-time budget it had to run in, so the loop
+  # structurally could not keep up with live audio and fell further behind every single
+  # iteration. That accumulating lag, not the segment length itself, is what "waiting
+  # almost 10 seconds for a transcript" actually was — it got worse the longer a call ran.
+  # One combined invocation measures at ~0.5s, safely under the 1s-per-micro-chunk budget.
+  # (This is also why the two ffmpeg calls were sequential single-purpose invocations in
+  # the first place, before this fix — ffmpeg can run multiple audio filters in one pass
+  # just fine, chained with a comma, this just hadn't been done yet.)
+  #
+  # -loglevel info, not error: volumedetect/silencedetect report their stats (mean_volume,
+  # silence_start/end/duration) via ffmpeg's own INFO-level logging, not as filter output
+  # on stdout. -loglevel error silently discards that entire line — confirmed live
+  # (2026-08-22): with -loglevel error this function's grep patterns below never matched
+  # anything, on ANY audio, so both detection methods always fell through and has_speech()
+  # always returned "has speech" regardless of actual content. That's the real cause of a
+  # real incident: every chunk, including pure silence, was being sent to Whisper, which
+  # hallucinated freely on it.
+  local combined_info
+  combined_info=$(ffmpeg -hide_banner -loglevel info -i "$chunk_file" \
+    -af "volumedetect,silencedetect=noise=${SILENCE_THRESHOLD_DB}dB:d=${SILENCE_DURATION}" \
+    -f null - 2>&1)
 
   # sed -E, not grep -oP: -P (PCRE) is a GNU grep extension that BSD grep
   # (macOS default) doesn't support — it would fail silently there, leaving
@@ -179,7 +194,7 @@ has_speech() {
   # info fix above addressed for a different tool gap. sed -E's POSIX ERE
   # (character classes + backreference) works identically on GNU and BSD sed.
   local mean_volume
-  mean_volume=$(echo "$vol_info" | sed -nE 's/.*mean_volume:[[:space:]]*(-?[0-9.]+).*/\1/p' | head -1)
+  mean_volume=$(echo "$combined_info" | sed -nE 's/.*mean_volume:[[:space:]]*(-?[0-9.]+).*/\1/p' | head -1)
 
   if [ -n "$mean_volume" ]; then
     # mean_volume is negative dB, more negative = quieter
@@ -188,17 +203,10 @@ has_speech() {
     fi
   fi
 
-  # Method 2: silencedetect as backup (see the -loglevel note on Method 1 above — applies
-  # here too, silencedetect's silence_start/end/duration lines are also INFO-level)
-  local silence_info
-  silence_info=$(ffmpeg -hide_banner -loglevel info -i "$chunk_file" \
-    -af "silencedetect=noise=${SILENCE_THRESHOLD_DB}dB:d=${SILENCE_DURATION}" \
-    -f null - 2>&1)
-
   # If silencedetect found silence spanning most of the chunk, skip it
-  if echo "$silence_info" | grep -q "silence_end"; then
+  if echo "$combined_info" | grep -q "silence_end"; then
     local silence_dur
-    silence_dur=$(echo "$silence_info" | sed -nE 's/.*silence_duration: ([0-9.]+).*/\1/p' | head -1)
+    silence_dur=$(echo "$combined_info" | sed -nE 's/.*silence_duration: ([0-9.]+).*/\1/p' | head -1)
     if [ -n "$silence_dur" ]; then
       local threshold
       threshold=$(echo "$MICRO_CHUNK_SECONDS * 0.8" | bc -l 2>/dev/null || echo "0.8")
@@ -483,10 +491,18 @@ finalize_segment() {
   for f in "${files[@]}"; do
     printf "file '%s'\n" "$f" >> "$listfile"
   done
-  ffmpeg -loglevel error -f concat -safe 0 -i "$listfile" -c copy -y "$out"
-  rm -f "$listfile"
 
-  process_chunk "$out" "$seq" "$start_sec" "$end_sec" &
+  # Concat AND process_chunk both run inside the same backgrounded subshell now, not just
+  # process_chunk (2026-08-28, real, measured performance fix). The concat step alone
+  # blocked the main loop for ~0.6s of wall time — and it ran synchronously, right at the
+  # exact moment a segment finishes and the next micro-chunk needs polling, on top of the
+  # has_speech() lag fixed above. Backgrounding the whole pipeline lets the main loop return
+  # to polling immediately instead of stalling at the one moment latency is most visible.
+  (
+    ffmpeg -loglevel error -f concat -safe 0 -i "$listfile" -c copy -y "$out"
+    rm -f "$listfile"
+    process_chunk "$out" "$seq" "$start_sec" "$end_sec"
+  ) &
 }
 
 start_capture "${TMPDIR}/chunk_%03d.wav"
