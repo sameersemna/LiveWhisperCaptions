@@ -1,0 +1,16 @@
+
+systemctl --user restart wireplumber pipewire pipewire-pulse
+
+
+pw-link -i
+
+pactl info
+
+pavucontrol &
+
+pactl unload-module module-bluetooth-discover
+pactl load-module module-bluetooth-discover
+
+systemctl --user restart pipewire wireplumber 2>/dev/null || pulseaudio -k
+
+bluetoothctl

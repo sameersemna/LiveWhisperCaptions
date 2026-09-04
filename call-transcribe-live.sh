@@ -425,6 +425,29 @@ process_chunk() {
   fi
 }
 
+# Fail fast and clearly if BT_SOURCE is unset/empty, rather than letting ffmpeg
+# hit it with a bare ":" (avfoundation) or "" (pulse) and produce a cryptic
+# "No AV capture device found" / "Unknown input format" error that doesn't say
+# what's actually wrong. Real incident (2026-09-02): a fresh macOS checkout had
+# no BT_SOURCE set (either .env didn't exist yet on that machine, or a Linux
+# .env was copied over without adding the macOS-specific value), and the
+# resulting `-i ":"` failed with an error giving no hint that BT_SOURCE itself
+# was the problem.
+if [ -z "$BT_SOURCE" ]; then
+  echo "${C_RED}BT_SOURCE is not set (check .env in this directory).${C_RESET}" >&2
+  case "$OS_NAME" in
+    Darwin)
+      echo "${C_RED}On macOS, BT_SOURCE must be an avfoundation audio device index or exact${C_RESET}" >&2
+      echo "${C_RED}device name. Run: ./call-transcribe-live.sh --list-devices${C_RESET}" >&2
+      ;;
+    Linux)
+      echo "${C_RED}On Linux, BT_SOURCE must be a PulseAudio source name. Run:${C_RESET}" >&2
+      echo "${C_RED}  ./call-transcribe-live.sh --list-devices${C_RESET}" >&2
+      ;;
+  esac
+  exit 1
+fi
+
 echo "${C_AMBER}VERMITTLUNG${C_RESET} ${C_DIM}// live call transcript${C_RESET}"
 echo "${C_GRAY}${C_DIM}Live transcription + translation started (pause-based segmentation, max ${MAX_SEGMENT_SECONDS}s/sentence). Press Ctrl+C to stop.${C_RESET}"
 echo "${C_GRAY}────────────────────────────────────────────────────────────${C_RESET}"
