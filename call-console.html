@@ -304,6 +304,23 @@
     font-size:15.5px;
     line-height:1.55;
   }
+  /* Speaker tag on each line, distinguishing the two capture channels (mic vs.
+     speaker-output monitor) — orthogonal to the pane's language coloring below.
+     Reuses the existing green/amber dim-pairs already in :root rather than adding
+     new colors. */
+  .speaker-tag{
+    display:inline-block;
+    font-family:var(--mono);
+    font-size:9px;
+    font-weight:700;
+    letter-spacing:.08em;
+    padding:1px 5px;
+    border-radius:3px;
+    margin-right:6px;
+    vertical-align:1px;
+  }
+  .speaker-tag.me{ background:var(--green-dim); color:var(--green); }
+  .speaker-tag.them{ background:var(--amber-dim); color:var(--amber); }
   .pane-head.de ~ .transcript .line .txt{color:var(--de);}
   .en-text{color:var(--en);}
   .de-text{color:var(--de);}
@@ -348,10 +365,15 @@
     </div>
     <div class="status-cluster">
       <div class="status"><span class="dot" id="dotMic"></span>MIC</div>
-      <div class="status"><span class="dot" id="dotServer"></span>SERVER</div>
-      <div class="status"><span class="dot" id="dotLive"></span>LIVE</div>
       <div class="meter" id="meter"></div>
       <span id="energyReadout" style="font-family:var(--mono); font-size:10px; color:var(--text-faint); min-width:88px;">lvl: —</span>
+
+      <div class="status"><span class="dot" id="dotSpeaker"></span>SPKR</div>
+      <div class="meter" id="meterSpeaker"></div>
+      <span id="energyReadoutSpeaker" style="font-family:var(--mono); font-size:10px; color:var(--text-faint); min-width:88px;">lvl: —</span>
+
+      <div class="status"><span class="dot" id="dotServer"></span>SERVER</div>
+      <div class="status"><span class="dot" id="dotLive"></span>LIVE</div>
 
       <span class="header-divider"></span>
 
@@ -438,6 +460,15 @@
           <button class="btn btn-ghost" id="refreshMicBtn" type="button" title="Re-scan input devices" style="padding:8px 12px;">↻</button>
         </div>
       </div>
+      <div class="field">
+        <label for="speakerSelect">Speaker output (system audio)</label>
+        <div style="display:flex; gap:6px;">
+          <select id="speakerSelect" style="min-width:0; flex:1;">
+            <option value="">detecting devices…</option>
+          </select>
+          <button class="btn btn-ghost" id="refreshSpeakerBtn" type="button" title="Re-scan input devices" style="padding:8px 12px;">↻</button>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -454,7 +485,7 @@
       </span>
     </div>
     <div class="transcript" id="deTranscript">
-      <div class="empty-state" id="deEmpty">Press <b>Start call</b> once your Bluetooth<br>source is set as the default input.<br>Source-language text appears here as it's heard.</div>
+      <div class="empty-state" id="deEmpty">Press <b>Start call</b> once your Bluetooth<br>source is set as the default input.<br>Source-language text appears here as it's heard,<br>tagged <b>ME</b>/<b>THEM</b> by which channel picked it up.</div>
     </div>
   </div>
   <div class="pane">
@@ -491,7 +522,7 @@
   const saveStored = (key, val) => { try { localStorage.setItem(STORE_PREFIX + key, val); } catch (e) { /* unavailable — non-fatal */ } };
   // Restores a saved value (if it's still a valid option) and wires the select to persist
   // future changes. Static-option selects only — micSelect is populated dynamically and
-  // handled separately in populateMicDevices().
+  // handled separately in populateAudioDevices().
   function persistSelect(el, key){
     const saved = loadStored(key);
     if (saved !== null && [...el.options].some(o => o.value === saved)) el.value = saved;
@@ -500,14 +531,15 @@
 
   const serverUrlEl = $('serverUrl'), chunkLenEl = $('chunkLen');
   const startBtn = $('startBtn'), stopBtn = $('stopBtn'), clearBtn = $('clearBtn');
-  const dotMic = $('dotMic'), dotServer = $('dotServer'), dotLive = $('dotLive');
+  const dotMic = $('dotMic'), dotSpeaker = $('dotSpeaker'), dotServer = $('dotServer'), dotLive = $('dotLive');
   const deTranscript = $('deTranscript'), enTranscript = $('enTranscript');
   const deEmpty = $('deEmpty'), enEmpty = $('enEmpty');
   const footerLeft = $('footerLeft'), footerRight = $('footerRight'), serverCheck = $('serverCheck');
   const latencyStatsEl = $('latencyStats');
-  const meterEl = $('meter'), jackStrip = $('jackStrip');
+  const meterEl = $('meter'), meterSpeakerEl = $('meterSpeaker'), jackStrip = $('jackStrip');
+  const energyReadoutSpeaker = $('energyReadoutSpeaker');
   const btHint = $('btHint');
-  const micSelect = $('micSelect');
+  const micSelect = $('micSelect'), speakerSelect = $('speakerSelect');
   const sourceLangEl = $('sourceLang');
   const dePaneLabel = $('dePaneLabel'), dePaneFlag = $('dePaneFlag');
   persistSelect(sourceLangEl, 'sourceLang');
@@ -529,8 +561,12 @@
 
   // build meter bars + jack strip
   const BAR_COUNT = 28, JACK_COUNT = 40;
-  for (let i=0;i<BAR_COUNT;i++){ const b=document.createElement('i'); meterEl.appendChild(b); }
-  const bars = [...meterEl.children];
+  function buildBars(container){
+    for (let i=0;i<BAR_COUNT;i++){ const b=document.createElement('i'); container.appendChild(b); }
+    return [...container.children];
+  }
+  const bars = buildBars(meterEl);
+  const barsSpeaker = buildBars(meterSpeakerEl);
   for (let i=0;i<JACK_COUNT;i++){ const j=document.createElement('div'); j.className='jack'; jackStrip.appendChild(j); }
   const jacks = [...jackStrip.children];
   let jackCursor = 0;
@@ -542,16 +578,22 @@
     jackCursor++;
   }
 
-  let audioCtx, mediaStream, analyser, sourceNode, procNode, silentGain;
+  // running/callStartMs/deCues/enCues/healthPollInterval/levelRaf are shared across both
+  // capture channels — one call, one timeline. Per-channel state (audioCtx, VAD segment
+  // accumulators, noise floor, live energy/threshold) lives on the channel objects created
+  // by createChannel() below instead of as module-level `let`s, since "Me" (mic) and "Them"
+  // (speaker-output monitor) each need their own independently-tracked adaptive threshold —
+  // a quiet monitor source and a noisy BT mic have nothing in common noise-floor-wise.
   let running = false;
   let levelRaf = null;
   let healthPollInterval = null;
-  let liveEnergy = 0;
-  let liveThreshold = 0; // the *current* adaptive threshold — see the noise-floor tracker below
   let callStartMs = 0; // performance.now() at call start — SRT cue times are relative to this
 
   // Cues actually rendered on screen, in call-relative ms — exported as SRT on demand.
   // Filtered/failed lines never reach these (see the success-path pushes in sendChunk).
+  // Each cue also carries speaker: 'me'|'them' (see createChannel()) — cuesToSrt() sorts by
+  // startMs and prefixes by speaker, since two independently-completing channels no longer
+  // push in audio-cut order (see its own comment).
   let deCues = [];
   let enCues = [];
 
@@ -576,27 +618,26 @@
   // same value that incident was manually corrected to, which is reassuring but not proof
   // this generalizes; if it turns out wrong for some environment, these are the constants
   // to retune, not a return to a hardcoded lvl number.
+  // NOISE_FLOOR_ALPHA/NOISE_MARGIN_*/MIN_THRESHOLD/MAX_THRESHOLD are shared *formula*
+  // constants — each channel still tracks its own noiseFloor value using them (see
+  // createChannel() below), same tuning, independent state.
   const NOISE_FLOOR_ALPHA = 0.05;
   const NOISE_MARGIN_ADD = 6;
   const NOISE_MARGIN_MULT = 1.4;
   const MIN_THRESHOLD = 8;
   const MAX_THRESHOLD = 80;
-  let noiseFloor = null; // bootstrapped from the first reading of the call, see start()
 
   // ---------- VAD endpointer ----------
-  // Capture is one continuous PCM stream for the whole call (via an AudioWorkletNode, see
-  // start()); this state machine decides where to cut it into chunks to send, using the
-  // same adaptive threshold as the level meter above — one number, computed once per
-  // reading, both roles. The tick itself runs inside the worklet's port.onmessage handler
-  // in start(), not here — dt comes from the exact sample count of each audio-thread batch
-  // (samples.length / sampleRate), not a wall-clock delta, so it stays correct even if the
-  // main thread is busy or the tab is backgrounded.
+  // Capture is one continuous PCM stream per channel (via an AudioWorkletNode, see
+  // createChannel().start()); this state machine decides where to cut each channel's stream
+  // into chunks to send, using that channel's own adaptive threshold as the level meter above
+  // — one number, computed once per reading, both roles. The tick itself runs inside the
+  // worklet's port.onmessage handler, not here — dt comes from the exact sample count of each
+  // audio-thread batch (samples.length / sampleRate), not a wall-clock delta, so it stays
+  // correct even if the main thread is busy or the tab is backgrounded.
   const HANGOVER_MS = 600;      // trailing silence required after speech before cutting a chunk
   const MIN_SPEECH_MS = 250;    // ignore blips shorter than this — not worth a round trip
   const IDLE_RESET_MS = 2000;   // drop accumulated pure-silence audio after this long (bounds memory)
-  let segFrames = [];           // Float32Array pieces captured since the last cut
-  let segHasSpeech = false;
-  let segSpeechMs = 0, segSilenceMs = 0, segMs = 0;
 
   const energyReadout = $('energyReadout');
 
@@ -659,9 +700,16 @@
     return `${pad(h,2)}:${pad(m,2)}:${pad(s,2)},${pad(msRem,3)}`;
   }
 
+  // Sorts a *copy* by startMs before numbering — necessary now that two independent
+  // channels push into the same cues array from their own async sendChunk() calls: only
+  // each channel's own DOM placeholder positions are guaranteed FIFO (see flushSegment()'s
+  // comment); the cues array itself is populated in whichever order each channel's network
+  // requests happen to resolve. Mirrors call-transcribe-live.sh's own established pattern
+  // (write live, sort once — see sort_srt_file() there) applied here for the first time.
   function cuesToSrt(cues){
-    return cues.map((c, i) =>
-      `${i+1}\n${srtTimestamp(c.startMs)} --> ${srtTimestamp(c.endMs)}\n${c.text}\n`
+    const sorted = [...cues].sort((a, b) => a.startMs - b.startMs);
+    return sorted.map((c, i) =>
+      `${i+1}\n${srtTimestamp(c.startMs)} --> ${srtTimestamp(c.endMs)}\n[${c.speaker === 'them' ? 'THEM' : 'ME'}] ${c.text}\n`
     ).join('\n');
   }
 
@@ -682,11 +730,12 @@
     URL.revokeObjectURL(url);
   }
 
-  function addLine(pane, emptyEl, text, cls){
+  function addLine(pane, emptyEl, text, cls, channel){
     emptyEl.style.display = 'none';
     const line = document.createElement('div');
     line.className = 'line';
-    line.innerHTML = `<div class="ts">${fmtTime()}</div><div class="txt ${cls}">${text.replace(/</g,'&lt;')}</div>`;
+    const tag = channel ? `<span class="speaker-tag ${channel.id}">${channel.label}</span>` : '';
+    line.innerHTML = `<div class="ts">${tag}${fmtTime()}</div><div class="txt ${cls}">${text.replace(/</g,'&lt;')}</div>`;
     pane.appendChild(line);
     pane.scrollTop = pane.scrollHeight;
     return line;
@@ -738,9 +787,12 @@
   // ---------- Explicit input device picker ----------
   // Browsers on Linux don't reliably honor PulseAudio's default source, especially once
   // a page has been granted mic access for a different device — so we let the user pick
-  // explicitly instead of trusting the OS default.
+  // explicitly instead of trusting the OS default. One enumerateDevices() call (and one
+  // permission prompt) populates *both* selects: micSelect (Bluetooth/Local, as before) and
+  // speakerSelect (PulseAudio/PipeWire ".monitor" sources — what's actually playing out the
+  // speakers, i.e. the "Them" channel; see the CLAUDE.md section on dual-channel capture).
   let btKeywordHint = '';
-  async function populateMicDevices(){
+  async function populateAudioDevices(){
     try{
       // A throwaway getUserMedia call unlocks real device labels (they're blank until
       // permission has been granted at least once for this origin).
@@ -750,8 +802,10 @@
       const devices = await navigator.mediaDevices.enumerateDevices();
       const inputs = devices.filter(d => d.kind === 'audioinput');
       micSelect.innerHTML = '';
+      speakerSelect.innerHTML = '';
       if (inputs.length === 0){
         micSelect.innerHTML = '<option value="">no input devices found</option>';
+        speakerSelect.innerHTML = '<option value="">None — mic only</option>';
         return;
       }
 
@@ -764,39 +818,68 @@
         return l.includes('bluetooth') || l.includes('headset') || l.includes('hands-free') || l.includes('hfp')
           || (btKeywordHint && l.includes(btKeywordHint.slice(0,8)));
       };
+      // A monitor source is PulseAudio/PipeWire's mechanism for exposing "whatever's playing
+      // to a sink" as a recordable input — the standard way to capture speaker/system audio
+      // on Linux, and confirmed to already show up here labeled "Monitor of ..." (see the
+      // CLAUDE.md gotcha about a past debugging session that accidentally picked one for the
+      // mic). These are pulled out into their own group and never offered as a mic choice —
+      // recording your own speaker output as your "microphone" would just capture everything
+      // this page already renders back through it (nothing audible today, but still wrong).
+      const isMonitorLabel = (label) => label.toLowerCase().includes('monitor');
 
       const btGroup = document.createElement('optgroup');
       btGroup.label = 'Bluetooth';
       const localGroup = document.createElement('optgroup');
       localGroup.label = 'Local / computer audio';
+      const monitorGroup = document.createElement('optgroup');
+      monitorGroup.label = 'Speaker output (monitor)';
 
-      let bestId = null;
+      let bestMicId = null;
+      let bestSpeakerId = null;
       inputs.forEach((d, i) => {
+        const label = d.label || `Input device ${i+1}`;
         const opt = document.createElement('option');
         opt.value = d.deviceId;
-        opt.textContent = d.label || `Input device ${i+1}`;
-        if (isBluetoothLabel(d.label || '')){
+        opt.textContent = label;
+        if (isMonitorLabel(label)){
+          monitorGroup.appendChild(opt);
+          if (bestSpeakerId === null) bestSpeakerId = d.deviceId;
+        } else if (isBluetoothLabel(label)){
           btGroup.appendChild(opt);
-          if (bestId === null) bestId = d.deviceId;
+          if (bestMicId === null) bestMicId = d.deviceId;
         } else {
           localGroup.appendChild(opt);
         }
       });
       if (btGroup.children.length) micSelect.appendChild(btGroup);
       if (localGroup.children.length) micSelect.appendChild(localGroup);
-      if (bestId !== null) micSelect.value = bestId;
+      if (bestMicId !== null) micSelect.value = bestMicId;
+
+      const noneOpt = document.createElement('option');
+      noneOpt.value = '';
+      noneOpt.textContent = 'None — mic only';
+      speakerSelect.appendChild(noneOpt);
+      if (monitorGroup.children.length) speakerSelect.appendChild(monitorGroup);
+      // Auto-select the first monitor source found, so speaker capture activates with no
+      // manual PulseAudio step — the user explicitly didn't want a "set up a null-sink every
+      // call" workflow. Still overridable (including back to "None") via the dropdown.
+      if (bestSpeakerId !== null) speakerSelect.value = bestSpeakerId;
 
       // Prefer a remembered device over the auto-detect heuristic above, but only if
       // it's still actually plugged in — deviceIds are stable per-origin across
       // reloads in practice, but not guaranteed across devices being unplugged.
       const savedMic = loadStored('micId');
       if (savedMic !== null && inputs.some(d => d.deviceId === savedMic)) micSelect.value = savedMic;
+      const savedSpeaker = loadStored('speakerId');
+      if (savedSpeaker !== null && (savedSpeaker === '' || inputs.some(d => d.deviceId === savedSpeaker))) speakerSelect.value = savedSpeaker;
     }catch(e){
       micSelect.innerHTML = '<option value="">mic permission needed — click Start call</option>';
+      speakerSelect.innerHTML = '<option value="">mic permission needed — click Start call</option>';
     }
   }
   micSelect.addEventListener('change', () => saveStored('micId', micSelect.value));
-  populateMicDevices();
+  speakerSelect.addEventListener('change', () => saveStored('speakerId', speakerSelect.value));
+  populateAudioDevices();
 
   // ---------- WAV encoding ----------
   // Resamples mono Float32 PCM to 16kHz using OfflineAudioContext rather than a hand-rolled
@@ -856,17 +939,21 @@
   // comment) — callers already fire-and-forget this (same as they did with sendChunk).
   //
   // The transcript/translation DOM lines for this segment are reserved right here — in
-  // the exact order segments are cut from the audio — before the await below, not inside
-  // sendChunk() after it. Consecutive segments' async work (resample, then two network
-  // requests) has no guaranteed ordering: segment N+1 could finish resampling or respond
-  // over the network before segment N does. sendChunk() only ever fills in a
-  // *already-positioned* placeholder line, never appends a new one, so display order is
-  // FIFO by audio order no matter which segment's async work happens to finish first.
-  async function flushSegment(send){
-    const frames = segFrames;
-    segFrames = [];
-    segHasSpeech = false;
-    segSpeechMs = 0; segSilenceMs = 0; segMs = 0;
+  // the exact order segments are cut from *this channel's* audio — before the await below,
+  // not inside sendChunk() after it. Consecutive segments from the same channel have no
+  // guaranteed async ordering (resample, then two network requests); sendChunk() only ever
+  // fills in an *already-positioned* placeholder line, never appends a new one, so each
+  // channel's own lines stay FIFO by its own audio order no matter which segment's async
+  // work finishes first. Across the two channels there's no such ordering guarantee or
+  // need for one — "Me" and "Them" cut and flush independently, and their lines interleave
+  // into the shared panes in whatever order each one's flushSegment() actually runs, which
+  // is a fine approximation of a live conversation. (SRT export sorts by timestamp
+  // regardless — see cuesToSrt().)
+  async function flushSegment(channel, send){
+    const frames = channel.segFrames;
+    channel.segFrames = [];
+    channel.segHasSpeech = false;
+    channel.segSpeechMs = 0; channel.segSilenceMs = 0; channel.segMs = 0;
     if (!send || !frames.length) return;
 
     let total = 0;
@@ -874,17 +961,17 @@
     const merged = new Float32Array(total);
     let off = 0;
     for (const f of frames){ merged.set(f, off); off += f.length; }
-    const audioMs = Math.round((total / audioCtx.sampleRate) * 1000);
+    const audioMs = Math.round((total / channel.audioCtx.sampleRate) * 1000);
 
     const t0 = performance.now();
     litJack();
-    const dePending = addLine(deTranscript, deEmpty, `…transcribing (${(audioMs/1000).toFixed(1)}s audio)`, 'de-text pending');
-    const enPending = addLine(enTranscript, enEmpty, '…translating', 'en-text pending');
+    const dePending = addLine(deTranscript, deEmpty, `…transcribing (${(audioMs/1000).toFixed(1)}s audio)`, 'de-text pending', channel);
+    const enPending = addLine(enTranscript, enEmpty, '…translating', 'en-text pending', channel);
     dePending.classList.add('pending');
     enPending.classList.add('pending');
 
-    const mono16k = await resampleTo16k(merged, audioCtx.sampleRate);
-    sendChunk(encodeWav(mono16k, 16000), audioMs, t0, dePending, enPending);
+    const mono16k = await resampleTo16k(merged, channel.audioCtx.sampleRate);
+    sendChunk(encodeWav(mono16k, 16000), audioMs, t0, dePending, enPending, channel);
   }
 
   // Rolling window of recent chunk timings, purely for eyeballing real-call latency —
@@ -923,7 +1010,7 @@
   // ones, so response-arrival order (which can differ from audio order) can't reorder
   // what's on screen. t0 is likewise measured by flushSegment() before the resample/
   // network work started, so latency numbers include that time too.
-  async function sendChunk(wavBlob, audioMs, t0, dePending, enPending){
+  async function sendChunk(wavBlob, audioMs, t0, dePending, enPending, channel){
     const sourceLang = sourceLangEl.value;
 
     // Shared cue timing for both panes: the chunk boundary (t0, i.e. "now") is the cue's
@@ -957,7 +1044,7 @@
       }
       dePending.classList.remove('pending');
       dePending.querySelector('.txt').textContent = text || '·';
-      if (text) deCues.push({startMs: cueStartMs, endMs: cueEndMs, text});
+      if (text) deCues.push({startMs: cueStartMs, endMs: cueEndMs, text, speaker: channel.id});
       return text;
     })().catch(err => {
       if (!(err instanceof HallucinationSkip)){
@@ -986,7 +1073,7 @@
         enPending.classList.remove('pending');
         enPending.querySelector('.txt').textContent = text || '·';
         enPending.querySelector('.ts').textContent += `  ·  ${ms}ms`;
-        if (text) enCues.push({startMs: cueStartMs, endMs: cueEndMs, text});
+        if (text) enCues.push({startMs: cueStartMs, endMs: cueEndMs, text, speaker: channel.id});
       } else {
         const fd = new FormData();
         fd.append('file', wavBlob, 'chunk.wav');
@@ -1005,7 +1092,7 @@
         }
         enPending.classList.remove('pending');
         enPending.querySelector('.txt').textContent = text || '·';
-        if (text) enCues.push({startMs: cueStartMs, endMs: cueEndMs, text});
+        if (text) enCues.push({startMs: cueStartMs, endMs: cueEndMs, text, speaker: channel.id});
       }
     })().catch(err => {
       if (err instanceof HallucinationSkip){
@@ -1026,7 +1113,7 @@
     }catch(e){
       if (e instanceof HallucinationSkip){
         setDot(dotServer, 'green');
-        footerLeft.textContent = `chunk filtered — hallucination pattern (lvl ${liveEnergy.toFixed(1)}/${liveThreshold.toFixed(1)}) · ${fmtTime()}`;
+        footerLeft.textContent = `chunk filtered — hallucination pattern (lvl ${channel.liveEnergy.toFixed(1)}/${channel.liveThreshold.toFixed(1)}) · ${fmtTime()}`;
       } else {
         setDot(dotServer, 'red');
         footerLeft.textContent = 'error: ' + e.message;
@@ -1044,190 +1131,260 @@
   // handler, not measured in this loop. Showing the threshold alongside the level (not just
   // the level against an invisible hardcoded number) makes the adaptive tracker's current
   // state visible/debuggable the same way the old fixed SILENCE_THRESHOLD was meant to be.
+  function drawMeter(channel, barsArr, readoutEl){
+    const avg = channel.liveEnergy;
+    readoutEl.textContent = `lvl: ${avg.toFixed(1)} / ${channel.liveThreshold.toFixed(1)}`;
+    readoutEl.style.color = avg < channel.liveThreshold ? 'var(--text-faint)' : 'var(--green)';
+    const activeCount = Math.round((avg/255) * BAR_COUNT * 1.6);
+    barsArr.forEach((b,i) => {
+      const on = i < activeCount;
+      const h = 15 + Math.min(85, (Math.sin((i/BAR_COUNT)*Math.PI) * (avg/255) * 100));
+      b.style.height = (on ? h : 15) + '%';
+      b.style.background = on ? (avg > 130 ? 'var(--red)' : 'var(--green)') : 'var(--hairline)';
+    });
+  }
+  function resetMeter(barsArr, readoutEl){
+    barsArr.forEach(b => { b.style.height = '15%'; b.style.background = 'var(--hairline)'; });
+    readoutEl.textContent = 'lvl: —';
+    readoutEl.style.color = 'var(--text-faint)';
+  }
   function startLevelMeter(){
     const draw = () => {
-      const avg = liveEnergy;
-      energyReadout.textContent = `lvl: ${avg.toFixed(1)} / ${liveThreshold.toFixed(1)}`;
-      energyReadout.style.color = avg < liveThreshold ? 'var(--text-faint)' : 'var(--green)';
-      const activeCount = Math.round((avg/255) * BAR_COUNT * 1.6);
-      bars.forEach((b,i) => {
-        const on = i < activeCount;
-        const h = 15 + Math.min(85, (Math.sin((i/BAR_COUNT)*Math.PI) * (avg/255) * 100));
-        b.style.height = (on ? h : 15) + '%';
-        b.style.background = on ? (avg > 130 ? 'var(--red)' : 'var(--green)') : 'var(--hairline)';
-      });
+      drawMeter(meChannel, bars, energyReadout);
+      // Only draw the speaker meter while that channel is actually active — it may never
+      // have been started (device set to "None", or getUserMedia failed non-fatally, see
+      // start()), in which case its liveEnergy/liveThreshold are stale zeros.
+      if (themChannel.audioCtx) drawMeter(themChannel, barsSpeaker, energyReadoutSpeaker);
       levelRaf = requestAnimationFrame(draw);
     };
     draw();
   }
 
+  // Continuous raw-PCM capture for the whole call, via an AudioWorkletNode running on the
+  // dedicated audio rendering thread — not the main thread, and not gated on rAF.
+  //
+  // This used to be a ScriptProcessorNode with VAD segment-cut decisions driven from
+  // requestAnimationFrame in startLevelMeter(). That combination is the root cause of a
+  // real accuracy regression (2026-08-22): rAF is throttled to ~1fps or halted entirely in
+  // a backgrounded tab — which Chrome only exempts for tabs producing *audible* output, and
+  // this tab deliberately never does (see the silentGain comment below) — so alt-tabbing
+  // away during a call, an extremely normal thing to do on a live call console, would stall
+  // or badly skew the VAD's wall-clock timing. ScriptProcessorNode itself also runs on the
+  // main thread and is documented to glitch under main-thread load. call-transcribe-live.sh
+  // has none of this: it's a standalone process with its own wall-clock timer, immune to
+  // any browser tab-visibility policy — which is exactly why it stayed accurate while this
+  // page didn't. AudioWorkletNode's process() callback runs on the audio thread regardless
+  // of tab visibility or main-thread business, so both capture and VAD timing are now
+  // immune to the same failure mode. The module is defined inline and loaded via a Blob URL
+  // (no separate file) to keep this project's single-file/no-build-step shape intact.
+  //
+  // Shared verbatim by both channels (identical processor, one definition) — each channel
+  // just loads it into its own AudioContext, since AudioWorklet modules are per-context.
+  const PCM_WORKLET_SRC = `
+    class PcmCaptureProcessor extends AudioWorkletProcessor {
+      constructor(opts){
+        super();
+        this.batchSize = (opts.processorOptions && opts.processorOptions.batchSize) || 4096;
+        this.buf = new Float32Array(this.batchSize);
+        this.off = 0;
+      }
+      process(inputs){
+        const ch = inputs[0] && inputs[0][0];
+        if (ch){
+          let read = 0;
+          while (read < ch.length){
+            const take = Math.min(this.batchSize - this.off, ch.length - read);
+            this.buf.set(ch.subarray(read, read + take), this.off);
+            this.off += take;
+            read += take;
+            if (this.off === this.batchSize){
+              this.port.postMessage(this.buf, [this.buf.buffer]);
+              this.buf = new Float32Array(this.batchSize);
+              this.off = 0;
+            }
+          }
+        }
+        return true;
+      }
+    }
+    registerProcessor('pcm-capture-processor', PcmCaptureProcessor);
+  `;
+
+  // One capture+VAD pipeline, independently instantiated per audio source ("Me" = mic,
+  // "Them" = speaker-output monitor — see the CLAUDE.md gotcha this feature is documented
+  // under). Everything that used to be a module-level `let` (audioCtx, the VAD segment
+  // accumulators, the adaptive noise floor, live energy/threshold for the meter) is now an
+  // instance field, so the two channels never share state that shouldn't be shared — most
+  // importantly the noise floor, since a speaker-output monitor and a Bluetooth mic have
+  // unrelated noise characteristics (the monitor is dead silent whenever nothing's playing).
+  function createChannel({ id, label, dotEl }){
+    return {
+      id, label, dotEl,
+      audioCtx: null, mediaStream: null, analyser: null, sourceNode: null,
+      procNode: null, silentGain: null,
+      noiseFloor: null,          // bootstrapped from this channel's first reading, see start()
+      liveEnergy: 0, liveThreshold: 0,
+      segFrames: [], segHasSpeech: false, segSpeechMs: 0, segSilenceMs: 0, segMs: 0,
+
+      async start(deviceId){
+        const constraints = {
+          audio: {
+            channelCount: 1,
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+            ...(deviceId ? { deviceId: { exact: deviceId } } : {})
+          }
+        };
+        this.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+        setDot(this.dotEl, 'green');
+
+        this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        this.sourceNode = this.audioCtx.createMediaStreamSource(this.mediaStream);
+        this.analyser = this.audioCtx.createAnalyser();
+        this.analyser.fftSize = 256;
+        this.sourceNode.connect(this.analyser);
+        const vadEnergyData = new Uint8Array(this.analyser.frequencyBinCount);
+
+        const workletUrl = URL.createObjectURL(new Blob([PCM_WORKLET_SRC], {type: 'application/javascript'}));
+        try {
+          await this.audioCtx.audioWorklet.addModule(workletUrl);
+        } finally {
+          URL.revokeObjectURL(workletUrl);
+        }
+        this.procNode = new AudioWorkletNode(this.audioCtx, 'pcm-capture-processor', { processorOptions: { batchSize: 4096 } });
+
+        // Capture + VAD tick, once per batch delivered from the audio thread. dt is derived
+        // from the exact sample count of this batch (not a measured wall-clock delta), so
+        // it's correct even if this handler itself gets delayed.
+        const channel = this;
+        this.procNode.port.onmessage = (e) => {
+          if (!running) return;
+          const samples = e.data;
+          channel.segFrames.push(samples);
+
+          channel.analyser.getByteFrequencyData(vadEnergyData);
+          let sum = 0;
+          for (let i=0;i<vadEnergyData.length;i++) sum += vadEnergyData[i];
+          const avg = sum / vadEnergyData.length;
+          channel.liveEnergy = avg; // consumed by startLevelMeter()'s rAF loop for display only
+
+          // Adaptive threshold — see the tracker's own comment above for the full rationale.
+          // Bootstrap on this channel's very first reading rather than starting at 0, so the
+          // first ~1s isn't wrongly treated as "way above threshold" before any real estimate
+          // exists.
+          if (channel.noiseFloor === null) channel.noiseFloor = avg;
+          const threshold = Math.min(MAX_THRESHOLD, Math.max(MIN_THRESHOLD,
+            Math.max(channel.noiseFloor + NOISE_MARGIN_ADD, channel.noiseFloor * NOISE_MARGIN_MULT)));
+          channel.liveThreshold = threshold; // consumed by startLevelMeter()'s rAF loop for display only
+
+          const dt = (samples.length / channel.audioCtx.sampleRate) * 1000;
+          const maxSegmentMs = parseInt(chunkLenEl.value, 10) * 1000;
+          if (avg >= threshold){
+            channel.segHasSpeech = true;
+            channel.segSpeechMs += dt;
+            channel.segSilenceMs = 0;
+          } else {
+            channel.segSilenceMs += dt;
+            // Only readings currently classified as silence feed the noise-floor estimate —
+            // real speech energy never pulls it upward, only actual quiet stretches do.
+            channel.noiseFloor = channel.noiseFloor * (1 - NOISE_FLOOR_ALPHA) + avg * NOISE_FLOOR_ALPHA;
+          }
+          channel.segMs += dt;
+
+          if (channel.segHasSpeech && channel.segSilenceMs >= HANGOVER_MS && channel.segSpeechMs >= MIN_SPEECH_MS){
+            flushSegment(channel, true);                          // natural end of utterance
+          } else if (channel.segHasSpeech && channel.segMs >= maxSegmentMs){
+            flushSegment(channel, true);                          // safety cap — continuous speech, no pause
+          } else if (!channel.segHasSpeech && channel.segMs >= IDLE_RESET_MS){
+            flushSegment(channel, false);                         // nothing but silence — drop it, bound memory
+          }
+        };
+
+        // AudioWorkletNode only runs while connected through to a destination. Route it
+        // through a near-silent (not exactly zero) gain rather than audioCtx.destination
+        // directly, so this channel's audio is never audibly looped back to the speakers —
+        // which matters even more now that one channel *is* the speaker output, where a
+        // literal loopback would be a feedback loop, not just an annoyance. Deliberately not
+        // literal 0: Chrome can auto-suspend an AudioContext it judges to be producing pure
+        // silence, which would stop this worklet's process() callback from being called at
+        // all — 1e-6 (~-120dBFS) is silent to any human ear and far below the noise floor,
+        // but registers as non-silent output, so that heuristic doesn't have a reason to
+        // trigger.
+        this.silentGain = this.audioCtx.createGain();
+        this.silentGain.gain.value = 1e-6;
+        this.sourceNode.connect(this.procNode);
+        this.procNode.connect(this.silentGain);
+        this.silentGain.connect(this.audioCtx.destination);
+
+        // Belt-and-suspenders: if the browser suspends the context anyway (backgrounded tab,
+        // power-saving heuristics), resume it as soon as we notice, rather than silently
+        // losing audio for the rest of the call.
+        this.audioCtx.onstatechange = () => {
+          if (running && this.audioCtx && this.audioCtx.state === 'suspended') this.audioCtx.resume();
+        };
+
+        this.segFrames = [];
+        this.segHasSpeech = false;
+        this.segSpeechMs = 0; this.segSilenceMs = 0; this.segMs = 0;
+        this.noiseFloor = null; // re-bootstrap fresh each call — a new call may be a different
+                                 // environment/BT link/system-audio mix entirely
+      },
+
+      stop(){
+        if (!this.audioCtx) return; // never started this call (no device selected, or start() failed) — nothing to tear down
+        // Send whatever speech was captured since the last cut immediately, rather than
+        // waiting on a hangover timer that will now never fire.
+        flushSegment(this, this.segHasSpeech);
+        setDot(this.dotEl, null);
+        if (this.procNode){ this.procNode.port.onmessage = null; this.procNode.disconnect(); this.procNode = null; }
+        if (this.silentGain){ this.silentGain.disconnect(); this.silentGain = null; }
+        if (this.mediaStream) this.mediaStream.getTracks().forEach(t => t.stop());
+        if (this.audioCtx){ this.audioCtx.onstatechange = null; this.audioCtx.close(); this.audioCtx = null; }
+      }
+    };
+  }
+
+  const meChannel = createChannel({ id: 'me', label: 'ME', dotEl: dotMic });
+  const themChannel = createChannel({ id: 'them', label: 'THEM', dotEl: dotSpeaker });
+
   async function start(){
     const ok = await checkServer();
     if (!ok && !confirm('Server not reachable right now. Start recording anyway?')) return;
 
-    try{
-      const deviceId = micSelect.value;
-      const constraints = {
-        audio: {
-          channelCount: 1,
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-          ...(deviceId ? { deviceId: { exact: deviceId } } : {})
-        }
-      };
-      mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
-    }catch(e){
-      alert('Could not access microphone: ' + e.message);
-      return;
-    }
-    setDot(dotMic, 'green');
-    setDot(dotLive, 'amber');
-    running = true;
-    startBtn.disabled = true;
-    stopBtn.disabled = false;
-    footerLeft.textContent = 'recording…';
-
     // SRT export covers cues from this Start click onward — a fresh timeline each call,
     // same as pressing Clear transcript would give you, so cue times stay monotonic
     // even if a call is stopped and restarted without clearing the visible transcript.
+    running = true;
     callStartMs = performance.now();
     deCues = [];
     enCues = [];
 
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    sourceNode = audioCtx.createMediaStreamSource(mediaStream);
-    analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 256;
-    sourceNode.connect(analyser);
-    const vadEnergyData = new Uint8Array(analyser.frequencyBinCount);
-
-    // Continuous raw-PCM capture for the whole call, via an AudioWorkletNode running on the
-    // dedicated audio rendering thread — not the main thread, and not gated on rAF.
-    //
-    // This used to be a ScriptProcessorNode with VAD segment-cut decisions driven from
-    // requestAnimationFrame in startLevelMeter(). That combination is the root cause of a
-    // real accuracy regression (2026-08-22): rAF is throttled to ~1fps or halted entirely in
-    // a backgrounded tab — which Chrome only exempts for tabs producing *audible* output, and
-    // this tab deliberately never does (see the silentGain comment below) — so alt-tabbing
-    // away during a call, an extremely normal thing to do on a live call console, would stall
-    // or badly skew the VAD's wall-clock timing. ScriptProcessorNode itself also runs on the
-    // main thread and is documented to glitch under main-thread load. call-transcribe-live.sh
-    // has none of this: it's a standalone process with its own wall-clock timer, immune to
-    // any browser tab-visibility policy — which is exactly why it stayed accurate while this
-    // page didn't. AudioWorkletNode's process() callback runs on the audio thread regardless
-    // of tab visibility or main-thread business, so both capture and VAD timing are now
-    // immune to the same failure mode. The module is defined inline and loaded via a Blob URL
-    // (no separate file) to keep this project's single-file/no-build-step shape intact.
-    const workletSrc = `
-      class PcmCaptureProcessor extends AudioWorkletProcessor {
-        constructor(opts){
-          super();
-          this.batchSize = (opts.processorOptions && opts.processorOptions.batchSize) || 4096;
-          this.buf = new Float32Array(this.batchSize);
-          this.off = 0;
-        }
-        process(inputs){
-          const ch = inputs[0] && inputs[0][0];
-          if (ch){
-            let read = 0;
-            while (read < ch.length){
-              const take = Math.min(this.batchSize - this.off, ch.length - read);
-              this.buf.set(ch.subarray(read, read + take), this.off);
-              this.off += take;
-              read += take;
-              if (this.off === this.batchSize){
-                this.port.postMessage(this.buf, [this.buf.buffer]);
-                this.buf = new Float32Array(this.batchSize);
-                this.off = 0;
-              }
-            }
-          }
-          return true;
-        }
-      }
-      registerProcessor('pcm-capture-processor', PcmCaptureProcessor);
-    `;
-    const workletUrl = URL.createObjectURL(new Blob([workletSrc], {type: 'application/javascript'}));
-    try {
-      await audioCtx.audioWorklet.addModule(workletUrl);
-    } finally {
-      URL.revokeObjectURL(workletUrl);
+    try{
+      await meChannel.start(micSelect.value);
+    }catch(e){
+      running = false;
+      alert('Could not access microphone: ' + e.message);
+      return;
     }
-    procNode = new AudioWorkletNode(audioCtx, 'pcm-capture-processor', { processorOptions: { batchSize: 4096 } });
 
-    // Capture + VAD tick, once per batch delivered from the audio thread. dt is derived from
-    // the exact sample count of this batch (not a measured wall-clock delta), so it's correct
-    // even if this handler itself gets delayed — unlike the old rAF-driven version.
-    procNode.port.onmessage = (e) => {
-      if (!running) return;
-      const samples = e.data;
-      segFrames.push(samples);
-
-      analyser.getByteFrequencyData(vadEnergyData);
-      let sum = 0;
-      for (let i=0;i<vadEnergyData.length;i++) sum += vadEnergyData[i];
-      const avg = sum / vadEnergyData.length;
-      liveEnergy = avg; // consumed by startLevelMeter()'s rAF loop for display only
-
-      // Adaptive threshold — see the tracker's own comment above for the full rationale.
-      // Bootstrap on the very first reading of the call rather than starting at 0, so the
-      // first ~1s isn't wrongly treated as "way above threshold" before any real estimate
-      // exists.
-      if (noiseFloor === null) noiseFloor = avg;
-      const threshold = Math.min(MAX_THRESHOLD, Math.max(MIN_THRESHOLD,
-        Math.max(noiseFloor + NOISE_MARGIN_ADD, noiseFloor * NOISE_MARGIN_MULT)));
-      liveThreshold = threshold; // consumed by startLevelMeter()'s rAF loop for display only
-
-      const dt = (samples.length / audioCtx.sampleRate) * 1000;
-      const maxSegmentMs = parseInt(chunkLenEl.value, 10) * 1000;
-      if (avg >= threshold){
-        segHasSpeech = true;
-        segSpeechMs += dt;
-        segSilenceMs = 0;
-      } else {
-        segSilenceMs += dt;
-        // Only readings currently classified as silence feed the noise-floor estimate —
-        // real speech energy never pulls it upward, only actual quiet stretches do.
-        noiseFloor = noiseFloor * (1 - NOISE_FLOOR_ALPHA) + avg * NOISE_FLOOR_ALPHA;
+    // The speaker-output channel is optional and non-fatal: "None" (no monitor device
+    // selected/available) or a getUserMedia failure on it just means this call runs mic-only,
+    // same as the console behaved before this feature existed — it should never block a call
+    // whose whole point is the mic side.
+    const speakerDeviceId = speakerSelect.value;
+    if (speakerDeviceId){
+      try{
+        await themChannel.start(speakerDeviceId);
+      }catch(e){
+        footerLeft.textContent = `speaker capture failed (${e.message}) — continuing mic-only`;
       }
-      segMs += dt;
+    }
 
-      if (segHasSpeech && segSilenceMs >= HANGOVER_MS && segSpeechMs >= MIN_SPEECH_MS){
-        flushSegment(true);                          // natural end of utterance
-      } else if (segHasSpeech && segMs >= maxSegmentMs){
-        flushSegment(true);                          // safety cap — continuous speech, no pause
-      } else if (!segHasSpeech && segMs >= IDLE_RESET_MS){
-        flushSegment(false);                         // nothing but silence — drop it, bound memory
-      }
-    };
-
-    // AudioWorkletNode only runs while connected through to a destination. Route it through
-    // a near-silent (not exactly zero) gain rather than audioCtx.destination directly, so mic
-    // audio is never audibly looped back to the speakers. Deliberately not literal 0: Chrome
-    // can auto-suspend an AudioContext it judges to be producing pure silence, which would
-    // stop this worklet's process() callback from being called at all — 1e-6 (~-120dBFS) is
-    // silent to any human ear and far below the noise floor, but registers as non-silent
-    // output, so that heuristic (if it applies here) doesn't have a reason to trigger.
-    silentGain = audioCtx.createGain();
-    silentGain.gain.value = 1e-6;
-    sourceNode.connect(procNode);
-    procNode.connect(silentGain);
-    silentGain.connect(audioCtx.destination);
-
-    // Belt-and-suspenders: if the browser suspends the context anyway (backgrounded tab,
-    // power-saving heuristics — the exact mechanism varies by browser and isn't fully
-    // documented), resume it as soon as we notice, rather than silently losing audio for the
-    // rest of the call.
-    audioCtx.onstatechange = () => {
-      if (running && audioCtx.state === 'suspended') audioCtx.resume();
-    };
-
-    segFrames = [];
-    segHasSpeech = false;
-    segSpeechMs = 0; segSilenceMs = 0; segMs = 0;
-    noiseFloor = null; // re-bootstrap the noise floor fresh each call — a new call may be a
-                        // different environment/BT link entirely, not a continuation of the last
+    setDot(dotLive, 'amber');
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    if (footerLeft.textContent.indexOf('speaker capture failed') === -1) footerLeft.textContent = 'recording…';
 
     startLevelMeter();
 
@@ -1245,18 +1402,15 @@
     startBtn.disabled = false;
     stopBtn.disabled = true;
     setDot(dotLive, null);
-    setDot(dotMic, null);
     footerLeft.textContent = 'stopped';
-    // Send whatever speech was captured since the last cut immediately, rather than
-    // waiting on a hangover timer that will now never fire.
-    flushSegment(segHasSpeech);
+
+    meChannel.stop();
+    themChannel.stop();
+
     if (healthPollInterval){ clearInterval(healthPollInterval); healthPollInterval = null; }
     if (levelRaf) cancelAnimationFrame(levelRaf);
-    bars.forEach(b => { b.style.height='15%'; b.style.background='var(--hairline)'; });
-    if (procNode){ procNode.port.onmessage = null; procNode.disconnect(); procNode = null; }
-    if (silentGain){ silentGain.disconnect(); silentGain = null; }
-    if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
-    if (audioCtx){ audioCtx.onstatechange = null; audioCtx.close(); }
+    resetMeter(bars, energyReadout);
+    resetMeter(barsSpeaker, energyReadoutSpeaker);
   }
 
   // ---------- Settings modal ----------
@@ -1279,15 +1433,20 @@
   });
 
   // Second chance to catch a suspended AudioContext, on top of the onstatechange handler set
-  // up in start() — tab visibility is exactly the moment a suspend is most likely, so re-check
-  // right when the tab becomes visible again rather than waiting on the statechange event.
+  // up in createChannel().start() — tab visibility is exactly the moment a suspend is most
+  // likely, so re-check right when the tab becomes visible again rather than waiting on the
+  // statechange event. Checked for both channels — either's AudioContext can be suspended
+  // independently.
   document.addEventListener('visibilitychange', () => {
-    if (running && audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+    if (!running) return;
+    if (meChannel.audioCtx && meChannel.audioCtx.state === 'suspended') meChannel.audioCtx.resume();
+    if (themChannel.audioCtx && themChannel.audioCtx.state === 'suspended') themChannel.audioCtx.resume();
   });
 
   startBtn.addEventListener('click', start);
   stopBtn.addEventListener('click', stop);
-  $('refreshMicBtn').addEventListener('click', populateMicDevices);
+  $('refreshMicBtn').addEventListener('click', populateAudioDevices);
+  $('refreshSpeakerBtn').addEventListener('click', populateAudioDevices);
   $('exportDeBtn').addEventListener('click', () => downloadSrt(deCues, 'transcript-original'));
   $('exportEnBtn').addEventListener('click', () => downloadSrt(enCues, 'transcript-english'));
   clearBtn.addEventListener('click', () => {
