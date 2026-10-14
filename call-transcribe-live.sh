@@ -28,6 +28,45 @@ fi
 # start_capture() below and the CLAUDE.md gotcha for the full story.
 OS_NAME="$(uname -s)"
 
+# ---------- PulseAudio/PipeWire capture-source helpers (Linux) ----------
+# Defined up here, above the --list-devices handling, because that listing uses
+# them too. All no-ops on macOS, which has no PulseAudio.
+
+# Every real source name, one per line. `awk '{print $2}'` and not `cut -f2`:
+# `pactl list short sources` separates most columns with *spaces* (a tab only
+# separates name and format), so cut would return the wrong field.
+list_sources() {
+  pactl list short sources 2>/dev/null | awk '{print $2}'
+}
+
+# A source's configured volume, in dB relative to unity (0.00 = no attenuation).
+# This matters because PulseAudio/PipeWire applies a source's own volume to what
+# is *captured* from it, one-for-one in dB — verified against an isolated null
+# sink (2026-10-14): a -41.1 dBFS tone replayed into a sink whose monitor sat at
+# 41% was captured 23.3 dB quieter, matching the -23,23 dB pactl reports for it.
+# Nothing in this script compensated for that, so any source sitting below 100%
+# fed the VAD a signal too quiet to clear its fixed thresholds — see CLAUDE.md.
+# Parsed from pactl's own dB report rather than recomputed from the percentage:
+# PulseAudio's %-to-dB curve is not a plain amplitude ratio (41% reports as
+# -23.23 dB, not 20*log10(0.41) = -7.7 dB). Locale-safe: some locales print a
+# comma decimal separator, so ',' is normalised to '.'.
+source_volume_db() {
+  local src="$1" v
+  v=$(pactl get-source-volume "$src" 2>/dev/null \
+      | sed -nE 's#.*/[[:space:]]*[0-9]+%[[:space:]]*/[[:space:]]*(-?[0-9]+[,.]?[0-9]*)[[:space:]]*dB.*#\1#p' \
+      | head -1 | tr ',' '.')
+  if [ -z "$v" ]; then
+    # Older pactl without get-source-volume: pull the same field out of the
+    # full listing, scoped to this source's own block.
+    v=$(pactl list sources 2>/dev/null | awk -v want="$src" '
+      /^[[:space:]]*Name:/  { inblock = ($2 == want) }
+      inblock && /^[[:space:]]*Volume:/ { print; exit }
+    ' | sed -nE 's#.*/[[:space:]]*[0-9]+%[[:space:]]*/[[:space:]]*(-?[0-9]+[,.]?[0-9]*)[[:space:]]*dB.*#\1#p' \
+        | head -1 | tr ',' '.')
+  fi
+  printf '%s' "${v:-0}"
+}
+
 # --list-devices / -l: print the platform-appropriate audio device list and
 # exit, so you can find what to put in BT_SOURCE (a PulseAudio source name on
 # Linux, an avfoundation device index/name on macOS) without reading ffmpeg
@@ -39,7 +78,13 @@ if [ "$1" = "--list-devices" ] || [ "$1" = "-l" ]; then
       ;;
     Linux)
       if command -v pactl >/dev/null 2>&1; then
-        pactl list sources short
+        pactl list short sources
+        echo ""
+        echo "Capture volume per source. Any attenuation here is applied to what is"
+        echo "captured and is compensated automatically at startup (0.00 dB = unity):"
+        list_sources | while IFS= read -r _src; do
+          printf '  %-58s %s dB\n' "$_src" "$(source_volume_db "$_src")"
+        done
       else
         echo "pactl not found — install pulseaudio-utils to list sources." >&2
         exit 1
@@ -425,33 +470,115 @@ process_chunk() {
   fi
 }
 
-# Fail fast and clearly if BT_SOURCE is unset/empty, rather than letting ffmpeg
-# hit it with a bare ":" (avfoundation) or "" (pulse) and produce a cryptic
-# "No AV capture device found" / "Unknown input format" error that doesn't say
-# what's actually wrong. Real incident (2026-09-02): a fresh macOS checkout had
-# no BT_SOURCE set (either .env didn't exist yet on that machine, or a Linux
-# .env was copied over without adding the macOS-specific value), and the
-# resulting `-i ":"` failed with an error giving no hint that BT_SOURCE itself
-# was the problem.
-if [ -z "$BT_SOURCE" ]; then
-  echo "${C_RED}BT_SOURCE is not set (check .env in this directory).${C_RESET}" >&2
-  case "$OS_NAME" in
-    Darwin)
-      echo "${C_RED}On macOS, BT_SOURCE must be an avfoundation audio device index or exact${C_RESET}" >&2
-      echo "${C_RED}device name. Run: ./call-transcribe-live.sh --list-devices${C_RESET}" >&2
-      ;;
-    Linux)
-      echo "${C_RED}On Linux, BT_SOURCE must be a PulseAudio source name. Run:${C_RESET}" >&2
-      echo "${C_RED}  ./call-transcribe-live.sh --list-devices${C_RESET}" >&2
-      ;;
-  esac
-  exit 1
+# Decides which device is actually captured.
+#
+# On Linux the hard part is that `ffmpeg -f pulse -i <bogus-name>` does NOT fail
+# — it silently attaches to the *default* source and exits 0 (see CLAUDE.md). So
+# a BT_SOURCE that has gone stale (new earphones, adapter dropped off the bus,
+# different machine) used to mean "transcribe some arbitrary other device" with
+# no indication that anything was wrong. That is exactly what happened after the
+# Ubuntu 26.04 upgrade: the Intel Centrino BT half vanished, bluez_source.*
+# stopped existing, and the script quietly captured the default source instead.
+resolve_capture_source() {
+  local sources
+  sources=$(list_sources)
+  if [ -z "$sources" ]; then
+    echo "${C_RED}No PulseAudio/PipeWire sources found — is the audio stack running?${C_RESET}" >&2
+    exit 1
+  fi
+
+  # 1. An explicitly configured BT_SOURCE that genuinely exists still wins, so
+  #    the original Bluetooth-HFP setup behaves exactly as it always did.
+  if [ -n "$BT_SOURCE" ] && [ "$BT_SOURCE" != "auto" ]; then
+    if printf '%s\n' "$sources" | grep -Fxq "$BT_SOURCE"; then
+      printf '%s' "$BT_SOURCE"
+      return 0
+    fi
+    # 2. Configured but gone. Never let ffmpeg pick a device behind your back.
+    echo "${C_AMBER}BT_SOURCE '$BT_SOURCE' is not a current audio source.${C_RESET}" >&2
+    echo "${C_AMBER}ffmpeg would silently capture the *default* device instead, which is not${C_RESET}" >&2
+    echo "${C_AMBER}what you configured — auto-selecting explicitly instead.${C_RESET}" >&2
+    echo "${C_AMBER}Set BT_SOURCE=auto to acknowledge this, or pick one via --list-devices.${C_RESET}" >&2
+  fi
+
+  # 3. Auto: the default sink's monitor. Whichever device you route the call to
+  #    — internal speakers, wired earphones or Bluetooth earphones — becomes the
+  #    default sink, so its monitor is the one source that always carries the far
+  #    end of the call. That is why the fallback is a monitor and not a
+  #    microphone: a monitor tracks the call audio across all of those, whereas a
+  #    mic only ever carries your own side.
+  local default_sink
+  default_sink=$(pactl get-default-sink 2>/dev/null)
+  if [ -n "$default_sink" ] && printf '%s\n' "$sources" | grep -Fxq "${default_sink}.monitor"; then
+    printf '%s' "${default_sink}.monitor"
+    return 0
+  fi
+
+  # 4. Any other monitor.
+  local m
+  m=$(printf '%s\n' "$sources" | grep -m1 '\.monitor$')
+  if [ -n "$m" ]; then
+    printf '%s' "$m"
+    return 0
+  fi
+
+  # 5. No monitor at all: fall back to the default source, but only if it is a
+  #    real capture device (a monitor here would just be the same dead end).
+  local default_source
+  default_source=$(pactl get-default-source 2>/dev/null)
+  if [ -n "$default_source" ] && printf '%s\n' "$sources" | grep -Fxq "$default_source" \
+     && ! printf '%s' "$default_source" | grep -q '\.monitor$'; then
+    printf '%s' "$default_source"
+    return 0
+  fi
+
+  # 6. Last resort: first non-monitor source, else the first source of any kind.
+  local s
+  s=$(printf '%s\n' "$sources" | grep -v '\.monitor$' | head -1)
+  [ -n "$s" ] || s=$(printf '%s\n' "$sources" | head -1)
+  printf '%s' "$s"
+}
+
+# Resolve the source and the gain needed to undo any attenuation its own volume
+# puts on the capture. Only ever raises (0..+40 dB): a source already at or above
+# unity is left exactly as it was, so an untouched Bluetooth setup behaves
+# identically to before any of this existed. Clamped at +40 dB so a source left
+# at a near-mute volume can't blow the noise floor up into "speech".
+if [ "$OS_NAME" = "Darwin" ]; then
+  # macOS resolves through avfoundation instead; none of the PulseAudio helpers
+  # apply there, and the "no device given" failure mode is a different one.
+  if [ -z "$BT_SOURCE" ]; then
+    echo "${C_RED}BT_SOURCE is not set (check .env in this directory).${C_RESET}" >&2
+    echo "${C_RED}On macOS, BT_SOURCE must be an avfoundation audio device index or exact${C_RESET}" >&2
+    echo "${C_RED}device name. Run: ./call-transcribe-live.sh --list-devices${C_RESET}" >&2
+    exit 1
+  fi
+  CAPTURE_SOURCE="$BT_SOURCE"
+  SRC_VOL_DB="0"
+  CAPTURE_GAIN_DB="0"
+  CAPTURE_GAIN_ACTIVE=0
+else
+  CAPTURE_SOURCE=$(resolve_capture_source)
+  SRC_VOL_DB=$(source_volume_db "$CAPTURE_SOURCE")
+  CAPTURE_GAIN_DB=$(awk -v v="$SRC_VOL_DB" 'BEGIN{ g = -v; if (g < 0) g = 0; if (g > 40) g = 40; printf "%.2f", g }')
+  CAPTURE_GAIN_ACTIVE=0
+  awk -v g="$CAPTURE_GAIN_DB" 'BEGIN{ exit !(g > 0.01) }' && CAPTURE_GAIN_ACTIVE=1
 fi
 
 echo "${C_AMBER}VERMITTLUNG${C_RESET} ${C_DIM}// live call transcript${C_RESET}"
 echo "${C_GRAY}${C_DIM}Live transcription + translation started (pause-based segmentation, max ${MAX_SEGMENT_SECONDS}s/sentence). Press Ctrl+C to stop.${C_RESET}"
 echo "${C_GRAY}────────────────────────────────────────────────────────────${C_RESET}"
 echo "${C_BOLD}${C_DE}[${LANGUAGE}]${C_RESET} = source transcription    ${C_BOLD}${C_EN}[EN]${C_RESET} = English translation    ${C_GRAY}.${C_RESET} = listening (silence)"
+if [ "$OS_NAME" = "Darwin" ]; then
+  echo "${C_BOLD}Capture device:${C_RESET} ${CAPTURE_SOURCE} (avfoundation)"
+else
+  echo "${C_BOLD}Capture source:${C_RESET} ${CAPTURE_SOURCE}"
+  if [ "$CAPTURE_GAIN_ACTIVE" -eq 1 ]; then
+    echo "${C_BOLD}Input gain:${C_RESET}     +${CAPTURE_GAIN_DB} dB (source volume is ${SRC_VOL_DB} dB — compensating to unity)"
+  else
+    echo "${C_BOLD}Input gain:${C_RESET}     none (source volume is ${SRC_VOL_DB} dB)"
+  fi
+fi
 echo "${C_GRAY}Saving SRT to ${SRT_SOURCE_FILE} and ${SRT_EN_FILE}${C_RESET}"
 echo ""
 
@@ -465,10 +592,21 @@ echo ""
 # var for what is conceptually the same "which mic" setting.
 start_capture() {
   local out_pattern="$1"
+  # Applied in the capture chain, not via `pactl set-source-volume`: raising a
+  # source's volume is a system-wide change that every other app capturing it
+  # (a browser in a call, say) would inherit — and on this machine the browser's
+  # own WebRTC capture really is pointed at the monitor, so that could have fed
+  # a 23 dB hotter signal back into the live call. A filter here is private to
+  # this script and has no side effects.
+  local gain_filter=()
+  if [ "${CAPTURE_GAIN_ACTIVE:-0}" -eq 1 ]; then
+    gain_filter=(-af "volume=${CAPTURE_GAIN_DB}dB")
+  fi
   case "$OS_NAME" in
     Darwin)
       ffmpeg -loglevel error \
-        -f avfoundation -i ":${BT_SOURCE}" \
+        -f avfoundation -i ":${CAPTURE_SOURCE}" \
+        "${gain_filter[@]}" \
         -ar 16000 -ac 1 -acodec pcm_s16le \
         -f segment -segment_time "$MICRO_CHUNK_SECONDS" -segment_format wav \
         -reset_timestamps 1 \
@@ -476,7 +614,8 @@ start_capture() {
       ;;
     Linux)
       ffmpeg -loglevel error \
-        -f pulse -i "$BT_SOURCE" \
+        -f pulse -i "$CAPTURE_SOURCE" \
+        "${gain_filter[@]}" \
         -ar 16000 -ac 1 -acodec pcm_s16le \
         -f segment -segment_time "$MICRO_CHUNK_SECONDS" -segment_format wav \
         -reset_timestamps 1 \
